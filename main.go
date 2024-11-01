@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -237,7 +238,8 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 }
 
 func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) error {
-	proxyURL := "socks5://" + proxy
+	normalizedProxy := normalizeProxy(proxy)
+	proxyURL := "socks5://" + normalizedProxy
 	proxyParsed, err := url.Parse(proxyURL)
 	if err != nil {
 		return fmt.Errorf("error parsing proxy URL: %v", err)
@@ -347,6 +349,17 @@ func readLines(filename string) ([]string, error) {
 	}
 
 	return lines, scanner.Err()
+}
+
+func normalizeProxy(proxy string) string {
+	proxy = strings.TrimSpace(proxy)
+	if strings.HasPrefix(proxy, "http://") {
+		return strings.TrimPrefix(proxy, "http://")
+	}
+	if strings.HasPrefix(proxy, "socks5://") {
+		return strings.TrimPrefix(proxy, "socks5://")
+	}
+	return proxy
 }
 
 func main() {
