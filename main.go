@@ -124,13 +124,33 @@ func NewDefaultProxyChecker(config Config) *DefaultProxyChecker {
 }
 
 func (pc *DefaultProxyChecker) GetProxyIP(proxy string) (*IPInfo, error) {
-	proxyURL, err := url.Parse(fmt.Sprintf(pc.config.ProxyURLTemplate, proxy))
-	if err != nil {
-		return nil, fmt.Errorf("failed to form proxy URL: %v", err)
+	var proxyURL *url.URL
+	var err error
+
+	if strings.HasPrefix(proxy, "socks5://") {
+		proxyURL, err = url.Parse(proxy)
+	} else if strings.HasPrefix(proxy, "http://") {
+		proxyURL, err = url.Parse(proxy)
+	} else {
+		proxyURL, err = url.Parse("socks5://" + proxy)
 	}
 
-	transport := &http.Transport{Proxy: http.ProxyURL(proxyURL)}
-	client := &http.Client{Transport: transport}
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse proxy URL: %v", err)
+	}
+
+	//transport with proxy
+	transport := &http.Transport{
+		Proxy: http.ProxyURL(proxyURL),
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
+
+	client := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
 
 	request, err := http.NewRequest("GET", pc.config.IPCheckURL, nil)
 	if err != nil {
@@ -238,9 +258,17 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 }
 
 func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) error {
-	normalizedProxy := normalizeProxy(proxy)
-	proxyURL := "socks5://" + normalizedProxy
-	proxyParsed, err := url.Parse(proxyURL)
+	var proxyURL *url.URL
+	var err error
+
+	if strings.HasPrefix(proxy, "socks5://") {
+		proxyURL, err = url.Parse(proxy)
+	} else if strings.HasPrefix(proxy, "http://") {
+		proxyURL, err = url.Parse(proxy)
+	} else {
+		proxyURL, err = url.Parse("socks5://" + proxy)
+	}
+
 	if err != nil {
 		return fmt.Errorf("error parsing proxy URL: %v", err)
 	}
@@ -252,7 +280,7 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 	ws.logger.Info(fmt.Sprintf("Connecting to %s", u.String()))
 
 	dialer := websocket.Dialer{
-		Proxy:            http.ProxyURL(proxyParsed),
+		Proxy:            http.ProxyURL(proxyURL),
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
 		HandshakeTimeout: 30 * time.Second,
 	}
