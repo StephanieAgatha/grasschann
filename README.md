@@ -40,8 +40,6 @@ cd grass-bot
 # Install dependencies
 go mod tidy
 
-# Build the application
-go build
 ```
 
 ## Configuration
@@ -65,7 +63,7 @@ user-id-2
 
 ```bash
 # Run the application
-./grass-bot
+go run main.go
 ```
 
 ## Technical Details
