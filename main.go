@@ -228,13 +228,14 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 					"id":            msg["id"].(string),
 					"origin_action": "AUTH",
 					"result": map[string]interface{}{
-						"browser_id":   deviceID,
-						"user_id":      userID,
-						"user_agent":   userAgent,
-						"timestamp":    time.Now().Unix(),
-						"device_type":  "extension",
-						"extension_id": "lkbnfiajjmbhnfledhphioinpickokdi",
-						"version":      "4.26.2",
+						"browser_id":  deviceID,
+						"user_id":     userID,
+						"user_agent":  userAgent,
+						"timestamp":   time.Now().Unix(),
+						"device_type": "desktop",
+						//"device_type":  "extension",
+						//"extension_id": "lkbnfiajjmbhnfledhphioinpickokdi",
+						"version": "4.28.1",
 					},
 				}
 				if err := c.WriteJSON(authResponse); err != nil {
@@ -288,7 +289,7 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 	headers := http.Header{}
 	headers.Set("User-Agent", userAgent)
 	headers.Set("pragma", "no-cache")
-	headers.Set("Origin", "chrome-extension://lkbnfiajjmbhnfledhphioinpickokdi")
+	//headers.Set("Origin", "chrome-extension://lkbnfiajjmbhnfledhphioinpickokdi")
 	headers.Set("Accept-Language", "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7")
 	headers.Set("Cache-Control", "no-cache")
 
