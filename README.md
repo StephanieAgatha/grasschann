@@ -32,7 +32,7 @@ go.uber.org/zap
 
 ```bash
 # Clone the repository
-git clone [repository-url]
+git clone https://github.com/StephanieAgatha/grasschann
 
 # Change directory
 cd grass-bot

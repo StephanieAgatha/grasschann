@@ -58,6 +58,12 @@ type FastHTTPClientPool struct {
 	pool sync.Pool
 }
 
+type ProxyDistributor struct {
+	userIDs []string
+	proxies []string
+	logger  *zap.Logger
+}
+
 type WSClient interface {
 	Connect(ctx context.Context, proxy, userID string) error
 }
@@ -337,20 +343,6 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 	return nil
 }
 
-type ProxyDistributor struct {
-	userIDs []string
-	proxies []string
-	logger  *zap.Logger
-}
-
-func NewProxyDistributor(userIDs, proxies []string, logger *zap.Logger) *ProxyDistributor {
-	return &ProxyDistributor{
-		userIDs: userIDs,
-		proxies: proxies,
-		logger:  logger,
-	}
-}
-
 func (pd *ProxyDistributor) Validate() error {
 	if len(pd.userIDs) == 0 || len(pd.proxies) == 0 {
 		return fmt.Errorf("no user IDs or proxies found")
@@ -385,6 +377,14 @@ func (pd *ProxyDistributor) DistributeProxies() map[string][]string {
 	}
 
 	return distribution
+}
+
+func NewProxyDistributor(userIDs, proxies []string, logger *zap.Logger) *ProxyDistributor {
+	return &ProxyDistributor{
+		userIDs: userIDs,
+		proxies: proxies,
+		logger:  logger,
+	}
 }
 
 func readLines(filename string) ([]string, error) {
