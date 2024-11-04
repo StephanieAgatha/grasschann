@@ -11,6 +11,40 @@ A high-performance WebSocket proxy manager written in Go, designed for handling 
 - Efficient connection pooling
 - Colorized logging with timezone support
 
+## Core Components
+
+1. **Connection Pool Management**
+   ```go
+   - FastHTTPClientPool: Manages HTTP client connections
+   - Connection metrics tracking
+   - Configurable timeouts and retry attempts
+   - Memory-efficient pooling implementation
+   ```
+
+2. **Proxy Handling**
+   ```go
+   - Proxy URL normalization
+   - Supports SOCKS5 and HTTP proxies
+   - Credential handling
+   - Distribution system for multiple users
+   ```
+
+3. **Caching System**
+   ```go
+   - TTL-based caching for IP info (5m duration)
+   - Automatic cleanup mechanism (10m interval)
+   - Thread-safe operations
+   - Memory-efficient storage
+   ```
+
+4. **WebSocket Management**
+   ```go
+   - Ping/Pong mechanism (26s interval)
+   - Write compression enabled
+   - Optimized buffer sizes (4096 bytes)
+   - Maximum message size (32MB)
+   ```
+
 ## Prerequisites
 
 ```bash
@@ -39,7 +73,6 @@ cd grasschann
 
 # Install dependencies
 go mod tidy
-
 ```
 
 ## Configuration
@@ -59,16 +92,33 @@ user-id-1
 user-id-2
 ```
 
-## Usage
+## Performance Optimizations
 
-```bash
-# Run the application
-go run main.go
-```
+1. **Memory Usage**
+   ```go
+   - Connection pooling with sync.Pool
+   - Request/Response pooling
+   - Pre-allocated response time slices
+   - Disabled default headers
+   ```
 
-## Technical Details
+2. **Network Efficiency**
+   ```go
+   - FastHTTP implementation
+   - Connection reuse
+   - Compression enabled
+   - Buffer optimization
+   ```
 
-### Connection Configuration
+3. **Error Resilience**
+   ```go
+   - Exponential backoff retry
+   - Panic recovery
+   - Graceful shutdowns
+   - Context cancellation support
+   ```
+
+## Technical Configuration
 
 ```go
 MaxConnsPerHost:      1000
@@ -78,61 +128,48 @@ MaxIdleConnDuration:  5m
 MaxConnDuration:      10m
 MaxConnWaitTimeout:   30s
 RetryInterval:        20s
+CacheDuration:        5m
+CacheCleanup:         10m
+RetryAttempts:        3
+BufferSize:          4096
+MaxMessageSize:       32MB
 ```
-
-### WebSocket Protocol
-
-- **Ping Interval**: 26 seconds
-- **Authentication**: Custom device ID based on proxy
-- **Device Type**: Desktop
-- **Version**: 4.28.1
-
-### Proxy Distribution
-
-The system distributes proxies among users following these rules:
-- Equal distribution of base proxies per user
-- Additional proxies assigned to the first user if total proxies not evenly divisible
-- Validation ensures user count doesn't exceed proxy count
-
-### Error Handling
-
-- Automatic reconnection on failure
-- Configurable retry intervals
-- Comprehensive error logging
-- Connection timeout management
-
-### Performance Optimizations
-
-- FastHTTP client pool for reduced memory allocation
-- Connection reuse with configurable timeouts
-- Goroutines for concurrent connections
-- Efficient proxy distribution algorithm
 
 ## Project Structure
 
 ```
-├── main.go                  # Main application entry
-├── proxy.txt               # Proxy list file
+├── main.go                # Main application entry
+├── proxy.txt              # Proxy list file
 ├── uid.txt                # User ID list file
 └── README.md              # Documentation
 ```
 
-## Core Components
+## Usage
 
-1. **Bot**: Main controller managing WebSocket client and proxy checker
-2. **DefaultWSClient**: WebSocket connection handler
-3. **DefaultProxyChecker**: Proxy IP checking with FastHTTP
-4. **FastHTTPClientPool**: Connection pool for optimized HTTP requests
-5. **ProxyDistributor**: Handles proxy distribution among users
+```bash
+# Run the application
+go run main.go
+```
 
 ## Logging
 
 The application uses Zap logger with:
 - Colorized output
-- Timezone support (Asia/Jakarta)
+- Asia/Jakarta timezone support
 - Structured logging format
-- Error tracking
+- Error tracking with stack traces
 - Connection status monitoring
+- Request/Response metrics
+
+## Error Handling
+
+The application implements comprehensive error handling:
+- Automatic reconnection on failure
+- Configurable retry intervals with exponential backoff
+- Detailed error logging with stack traces
+- Connection timeout management
+- Panic recovery in goroutines
+- Context cancellation handling
 
 ## License
 
@@ -145,6 +182,11 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 3. Commit your changes (`git commit -m 'Add some amazing feature'`)
 4. Push to the branch (`git push origin feature/amazing-feature`)
 5. Open a Pull Request
+
+## Author
+
+- Stephanie Agatha
+- GitHub: [@StephanieAgatha](https://github.com/StephanieAgatha)
 
 ## Disclaimer
 

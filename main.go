@@ -13,6 +13,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -20,6 +21,18 @@ import (
 	"github.com/itzngga/fake-useragent"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
+)
+
+const (
+	defaultMaxConnsPerHost     = 1000
+	defaultReadTimeout         = 30 * time.Second
+	defaultWriteTimeout        = 30 * time.Second
+	defaultMaxIdleConnDuration = 5 * time.Minute
+	defaultMaxConnDuration     = 10 * time.Minute
+	defaultMaxConnWaitTimeout  = 30 * time.Second
+	defaultRetryAttempts       = 3
+	defaultCacheDuration       = 5 * time.Minute
+	defaultCacheCleanup        = 10 * time.Minute
 )
 
 type Config struct {
@@ -52,10 +65,24 @@ type DefaultWSClient struct {
 type DefaultProxyChecker struct {
 	config     Config
 	clientPool *FastHTTPClientPool
+	cache      *ProxyCache
+}
+
+type cacheEntry struct {
+	data      *IPInfo
+	timestamp time.Time
+}
+
+type ProxyCache struct {
+	data  sync.Map
+	ttl   time.Duration
+	mutex sync.RWMutex
 }
 
 type FastHTTPClientPool struct {
-	pool sync.Pool
+	pool    sync.Pool
+	metrics *Metrics
+	mu      sync.RWMutex
 }
 
 type ProxyDistributor struct {
@@ -64,20 +91,27 @@ type ProxyDistributor struct {
 	logger  *zap.Logger
 }
 
+type Metrics struct {
+	ActiveConnections int32
+	TotalRequests     int64
+	FailedRequests    int64
+	ResponseTimes     []time.Duration
+}
+
+type ProxyURL struct {
+	Scheme   string
+	Username string
+	Password string
+	Host     string
+	Port     string
+}
+
 type WSClient interface {
 	Connect(ctx context.Context, proxy, userID string) error
 }
 
 type ProxyChecker interface {
 	GetProxyIP(proxy string) (*IPInfo, error)
-}
-
-func (p *FastHTTPClientPool) Get() *fasthttp.Client {
-	return p.pool.Get().(*fasthttp.Client)
-}
-
-func (p *FastHTTPClientPool) Put(c *fasthttp.Client) {
-	p.pool.Put(c)
 }
 
 func NewBot(config Config, logger *zap.Logger) *Bot {
@@ -98,10 +132,22 @@ func NewDefaultWSClient(config Config, logger *zap.Logger, proxyCheck ProxyCheck
 	}
 }
 
+func NewProxyCache(ttl time.Duration) *ProxyCache {
+	cache := &ProxyCache{
+		ttl: ttl,
+	}
+
+	//start cleanup routine
+	go cache.cleanup()
+
+	return cache
+}
+
 func NewDefaultProxyChecker(config Config) *DefaultProxyChecker {
 	return &DefaultProxyChecker{
 		config:     config,
 		clientPool: NewFastHTTPClientPool(),
+		cache:      NewProxyCache(defaultCacheDuration),
 	}
 }
 
@@ -110,15 +156,103 @@ func NewFastHTTPClientPool() *FastHTTPClientPool {
 		pool: sync.Pool{
 			New: func() interface{} {
 				return &fasthttp.Client{
-					MaxConnsPerHost:     1000,
-					ReadTimeout:         30 * time.Second,
-					WriteTimeout:        30 * time.Second,
-					MaxIdleConnDuration: 5 * time.Minute,
-					MaxConnDuration:     10 * time.Minute,
-					MaxConnWaitTimeout:  30 * time.Second,
+					MaxConnsPerHost:               defaultMaxConnsPerHost,
+					ReadTimeout:                   defaultReadTimeout,
+					WriteTimeout:                  defaultWriteTimeout,
+					MaxIdleConnDuration:           defaultMaxIdleConnDuration,
+					MaxConnDuration:               defaultMaxConnDuration,
+					MaxConnWaitTimeout:            defaultMaxConnWaitTimeout,
+					NoDefaultUserAgentHeader:      true,             //reduce memory alloc
+					DisableHeaderNamesNormalizing: true,             //optimize perform
+					DisablePathNormalizing:        true,             //optimize perform
+					MaxResponseBodySize:           30 * 1024 * 1024, //30MB max response
+					MaxIdemponentCallAttempts:     defaultRetryAttempts,
 				}
 			},
 		},
+		metrics: &Metrics{
+			ResponseTimes: make([]time.Duration, 0, 1000), //pre-allocate slice
+		},
+	}
+}
+
+// get gets value from cache
+func (c *ProxyCache) Get(key string) (*IPInfo, bool) {
+	value, exists := c.data.Load(key)
+	if !exists {
+		return nil, false
+	}
+
+	entry := value.(*cacheEntry)
+
+	//check if entry is expired
+	if time.Since(entry.timestamp) > c.ttl {
+		c.data.Delete(key)
+		return nil, false
+	}
+
+	return entry.data, true
+}
+
+// set sets value in cache
+func (c *ProxyCache) Set(key string, value *IPInfo) {
+	c.data.Store(key, &cacheEntry{
+		data:      value,
+		timestamp: time.Now(),
+	})
+}
+
+// cleanup removes expired entries
+func (c *ProxyCache) cleanup() {
+	ticker := time.NewTicker(defaultCacheCleanup)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		c.data.Range(func(key, value interface{}) bool {
+			entry := value.(*cacheEntry)
+			if time.Since(entry.timestamp) > c.ttl {
+				c.data.Delete(key)
+			}
+			return true
+		})
+	}
+}
+
+func (p *FastHTTPClientPool) Get() *fasthttp.Client {
+	atomic.AddInt32(&p.metrics.ActiveConnections, 1)
+	client := p.pool.Get().(*fasthttp.Client)
+	return client
+}
+
+func (p *FastHTTPClientPool) Put(c *fasthttp.Client) {
+	c.Dial = nil
+	c.TLSConfig = nil
+
+	atomic.AddInt32(&p.metrics.ActiveConnections, -1)
+	p.pool.Put(c)
+}
+
+func (p *FastHTTPClientPool) GetMetrics() Metrics {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return Metrics{
+		ActiveConnections: atomic.LoadInt32(&p.metrics.ActiveConnections),
+		TotalRequests:     atomic.LoadInt64(&p.metrics.TotalRequests),
+		FailedRequests:    atomic.LoadInt64(&p.metrics.FailedRequests),
+		ResponseTimes:     append([]time.Duration{}, p.metrics.ResponseTimes...), //copy slice
+	}
+}
+
+func (p *FastHTTPClientPool) AddResponseTime(duration time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.metrics.ResponseTimes = append(p.metrics.ResponseTimes, duration)
+
+	//keep only last 1000 response times
+	if len(p.metrics.ResponseTimes) > 1000 {
+		p.metrics.ResponseTimes = p.metrics.ResponseTimes[1:]
 	}
 }
 
@@ -168,39 +302,64 @@ func initLogger() *zap.Logger {
 }
 
 func (pc *DefaultProxyChecker) GetProxyIP(proxy string) (*IPInfo, error) {
-	var proxyURL string
-	if strings.HasPrefix(proxy, "socks5://") {
-		proxyURL = proxy
-	} else if strings.HasPrefix(proxy, "http://") {
-		proxyURL = proxy
-	} else {
-		proxyURL = "socks5://" + proxy
+	// Check cache first
+	if cached, exists := pc.cache.Get(proxy); exists {
+		return cached, nil
 	}
 
+	start := time.Now()
+	proxyURL := pc.normalizeProxyURL(proxy)
+
 	client := pc.clientPool.Get()
+	defer func() {
+		pc.clientPool.Put(client)
+		pc.clientPool.AddResponseTime(time.Since(start))
+	}()
+
 	client.Dial = fasthttpproxy.FasthttpSocksDialer(proxyURL)
 	client.TLSConfig = &tls.Config{
 		InsecureSkipVerify: true,
 	}
-	defer pc.clientPool.Put(client)
 
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 
 	req.SetRequestURI(pc.config.IPCheckURL)
-	req.Header.SetMethod("GET")
+	req.Header.SetMethod(fasthttp.MethodGet)
 
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseResponse(resp)
 
-	if err := client.DoTimeout(req, resp, 30*time.Second); err != nil {
-		return nil, fmt.Errorf("failed to perform GET request: %v", err)
+	var err error
+	for i := 0; i < defaultRetryAttempts; i++ {
+		err = client.DoTimeout(req, resp, defaultReadTimeout)
+		if err == nil {
+			break
+		}
+
+		if i < defaultRetryAttempts-1 {
+			time.Sleep(time.Duration(1<<uint(i)) * time.Second)
+		}
+	}
+
+	if err != nil {
+		atomic.AddInt64(&pc.clientPool.metrics.FailedRequests, 1)
+		return nil, fmt.Errorf("request failed after %d attempts: %w", defaultRetryAttempts, err)
+	}
+
+	atomic.AddInt64(&pc.clientPool.metrics.TotalRequests, 1)
+
+	if resp.StatusCode() != fasthttp.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode())
 	}
 
 	var ipInfo IPInfo
 	if err := json.Unmarshal(resp.Body(), &ipInfo); err != nil {
-		return nil, fmt.Errorf("could not unmarshal response body: %v", err)
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
+
+	//set cache
+	pc.cache.Set(proxy, &ipInfo)
 
 	return &ipInfo, nil
 }
@@ -250,7 +409,7 @@ func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, prox
 }
 
 func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn, ipInfo *IPInfo, deviceID, userID string) {
-	userAgent := browser.Random()
+	userAgent := browser.MacOSX()
 
 	for {
 		select {
@@ -307,40 +466,64 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 
 func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) error {
 	deviceID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte(proxy)).String()
-	userAgent := browser.Random()
+	userAgent := browser.MacOSX()
+
+	ipInfo, err := ws.proxyCheck.GetProxyIP(proxy)
+	if err != nil {
+		return fmt.Errorf("proxy check failed: %w", err)
+	}
 
 	wsURL := fmt.Sprintf("wss://%s/", ws.config.WSSHost)
-	ws.logger.Info(fmt.Sprintf("Connecting to %s", wsURL))
+	ws.logger.Info(fmt.Sprintf("Connecting to %s using IP %s", wsURL, ipInfo.IP))
 
 	headers := prepareHeaders(userAgent)
+	httpHeaders := fastHTTPHeadersToHTTP(headers)
 
 	dialer := websocket.Dialer{
 		Proxy:            createProxyDialerWithFastHTTP(proxy),
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
-		HandshakeTimeout: 30 * time.Second,
+		HandshakeTimeout: defaultReadTimeout,
+		WriteBufferSize:  4096, // Optimized buffer size
+		ReadBufferSize:   4096,
 	}
-
-	httpHeaders := fastHTTPHeadersToHTTP(headers)
 
 	c, _, err := dialer.DialContext(ctx, wsURL, httpHeaders)
 	if err != nil {
-		return fmt.Errorf("error connecting to WebSocket: %v", err)
+		return fmt.Errorf("websocket connection failed: %w", err)
 	}
-	defer c.Close()
 
-	ws.logger.Info("Connected to WebSocket")
+	defer func() {
+		c.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		c.Close()
+	}()
 
-	ipInfo, err := ws.proxyCheck.GetProxyIP(proxy)
-	if err != nil {
-		return fmt.Errorf("error getting proxy IP info: %v", err)
-	}
-	ws.logger.Info(fmt.Sprintf("Proxy location info - IP: %s, City: %s, Region: %s",
-		ipInfo.IP, ipInfo.City, ipInfo.Region))
+	c.EnableWriteCompression(true)
+	c.SetReadLimit(32 << 20) // 32MB max message size
 
-	go ws.sendPing(ctx, c, ipInfo.IP)
-	ws.handleMessages(ctx, c, ipInfo, deviceID, userID)
+	done := make(chan struct{})
+	defer close(done)
 
-	return nil
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ws.logger.Error("Panic in ping handler", zap.Any("error", r))
+			}
+		}()
+		ws.sendPing(ctx, c, ipInfo.IP)
+	}()
+
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				ws.logger.Error("Panic in message handler", zap.Any("error", r))
+			}
+		}()
+		ws.handleMessages(ctx, c, ipInfo, deviceID, userID)
+	}()
+
+	<-ctx.Done()
+	return ctx.Err()
 }
 
 func (pd *ProxyDistributor) Validate() error {
@@ -385,6 +568,64 @@ func NewProxyDistributor(userIDs, proxies []string, logger *zap.Logger) *ProxyDi
 		proxies: proxies,
 		logger:  logger,
 	}
+}
+
+// normalizeProxyURL normalizes and validates proxy URL
+func (pc *DefaultProxyChecker) normalizeProxyURL(proxy string) string {
+	// Remove whitespace
+	proxy = strings.TrimSpace(proxy)
+
+	// If already has scheme, return as is
+	if strings.HasPrefix(proxy, "socks5://") || strings.HasPrefix(proxy, "http://") {
+		return proxy
+	}
+
+	// Parse proxy parts
+	var proxyURL ProxyURL
+
+	// Split credentials and host
+	parts := strings.Split(proxy, "@")
+	if len(parts) == 2 {
+		// Has credentials
+		creds := strings.Split(parts[0], ":")
+		if len(creds) == 2 {
+			proxyURL.Username = creds[0]
+			proxyURL.Password = creds[1]
+		}
+		hostPort := strings.Split(parts[1], ":")
+		if len(hostPort) == 2 {
+			proxyURL.Host = hostPort[0]
+			proxyURL.Port = hostPort[1]
+		}
+	} else {
+		// No credentials
+		hostPort := strings.Split(proxy, ":")
+		if len(hostPort) == 2 {
+			proxyURL.Host = hostPort[0]
+			proxyURL.Port = hostPort[1]
+		}
+	}
+
+	// Build URL
+	var builder strings.Builder
+	builder.WriteString("socks5://")
+
+	if proxyURL.Username != "" {
+		builder.WriteString(url.QueryEscape(proxyURL.Username))
+		if proxyURL.Password != "" {
+			builder.WriteString(":")
+			builder.WriteString(url.QueryEscape(proxyURL.Password))
+		}
+		builder.WriteString("@")
+	}
+
+	builder.WriteString(proxyURL.Host)
+	if proxyURL.Port != "" {
+		builder.WriteString(":")
+		builder.WriteString(proxyURL.Port)
+	}
+
+	return builder.String()
 }
 
 func readLines(filename string) ([]string, error) {
