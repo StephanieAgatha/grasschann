@@ -6,7 +6,8 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttpproxy"
 	"net/http"
 	"net/url"
 	"os"
@@ -42,6 +43,21 @@ type Bot struct {
 	proxyCheck ProxyChecker
 }
 
+type DefaultWSClient struct {
+	config     Config
+	logger     *zap.Logger
+	proxyCheck ProxyChecker
+}
+
+type DefaultProxyChecker struct {
+	config     Config
+	clientPool *FastHTTPClientPool
+}
+
+type FastHTTPClientPool struct {
+	pool sync.Pool
+}
+
 type WSClient interface {
 	Connect(ctx context.Context, proxy, userID string) error
 }
@@ -50,15 +66,62 @@ type ProxyChecker interface {
 	GetProxyIP(proxy string) (*IPInfo, error)
 }
 
-type DefaultWSClient struct {
-	config     Config
-	logger     *zap.Logger
-	proxyCheck ProxyChecker
+func (p *FastHTTPClientPool) Get() *fasthttp.Client {
+	return p.pool.Get().(*fasthttp.Client)
 }
 
-type DefaultProxyChecker struct {
-	config Config
-	client *http.Client
+func (p *FastHTTPClientPool) Put(c *fasthttp.Client) {
+	p.pool.Put(c)
+}
+
+func NewBot(config Config, logger *zap.Logger) *Bot {
+	proxyChecker := NewDefaultProxyChecker(config)
+	return &Bot{
+		config:     config,
+		logger:     logger,
+		wsClient:   NewDefaultWSClient(config, logger, proxyChecker),
+		proxyCheck: proxyChecker,
+	}
+}
+
+func NewDefaultWSClient(config Config, logger *zap.Logger, proxyCheck ProxyChecker) *DefaultWSClient {
+	return &DefaultWSClient{
+		config:     config,
+		logger:     logger,
+		proxyCheck: proxyCheck,
+	}
+}
+
+func NewDefaultProxyChecker(config Config) *DefaultProxyChecker {
+	return &DefaultProxyChecker{
+		config:     config,
+		clientPool: NewFastHTTPClientPool(),
+	}
+}
+
+func NewFastHTTPClientPool() *FastHTTPClientPool {
+	return &FastHTTPClientPool{
+		pool: sync.Pool{
+			New: func() interface{} {
+				return &fasthttp.Client{
+					MaxConnsPerHost:     1000,
+					ReadTimeout:         30 * time.Second,
+					WriteTimeout:        30 * time.Second,
+					MaxIdleConnDuration: 5 * time.Minute,
+					MaxConnDuration:     10 * time.Minute,
+					MaxConnWaitTimeout:  30 * time.Second,
+				}
+			},
+		},
+	}
+}
+
+func fastHTTPHeadersToHTTP(fHeaders *fasthttp.RequestHeader) http.Header {
+	httpHeaders := make(http.Header)
+	fHeaders.VisitAll(func(key, value []byte) {
+		httpHeaders.Set(string(key), string(value))
+	})
+	return httpHeaders
 }
 
 func initLogger() *zap.Logger {
@@ -98,82 +161,62 @@ func initLogger() *zap.Logger {
 	return zap.New(core)
 }
 
-func NewBot(config Config, logger *zap.Logger) *Bot {
-	proxyChecker := NewDefaultProxyChecker(config)
-	return &Bot{
-		config:     config,
-		logger:     logger,
-		wsClient:   NewDefaultWSClient(config, logger, proxyChecker),
-		proxyCheck: proxyChecker,
-	}
-}
-
-func NewDefaultWSClient(config Config, logger *zap.Logger, proxyCheck ProxyChecker) *DefaultWSClient {
-	return &DefaultWSClient{
-		config:     config,
-		logger:     logger,
-		proxyCheck: proxyCheck,
-	}
-}
-
-func NewDefaultProxyChecker(config Config) *DefaultProxyChecker {
-	return &DefaultProxyChecker{
-		config: config,
-		client: &http.Client{},
-	}
-}
-
 func (pc *DefaultProxyChecker) GetProxyIP(proxy string) (*IPInfo, error) {
-	var proxyURL *url.URL
-	var err error
-
+	var proxyURL string
 	if strings.HasPrefix(proxy, "socks5://") {
-		proxyURL, err = url.Parse(proxy)
+		proxyURL = proxy
 	} else if strings.HasPrefix(proxy, "http://") {
-		proxyURL, err = url.Parse(proxy)
+		proxyURL = proxy
 	} else {
-		proxyURL, err = url.Parse("socks5://" + proxy)
+		proxyURL = "socks5://" + proxy
 	}
 
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse proxy URL: %v", err)
+	client := pc.clientPool.Get()
+	client.Dial = fasthttpproxy.FasthttpSocksDialer(proxyURL)
+	client.TLSConfig = &tls.Config{
+		InsecureSkipVerify: true,
 	}
+	defer pc.clientPool.Put(client)
 
-	//transport with proxy
-	transport := &http.Transport{
-		Proxy: http.ProxyURL(proxyURL),
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true,
-		},
-	}
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
 
-	client := &http.Client{
-		Transport: transport,
-		Timeout:   30 * time.Second,
-	}
+	req.SetRequestURI(pc.config.IPCheckURL)
+	req.Header.SetMethod("GET")
 
-	request, err := http.NewRequest("GET", pc.config.IPCheckURL, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to form GET request: %v", err)
-	}
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseResponse(resp)
 
-	response, err := client.Do(request)
-	if err != nil {
+	if err := client.DoTimeout(req, resp, 30*time.Second); err != nil {
 		return nil, fmt.Errorf("failed to perform GET request: %v", err)
-	}
-	defer response.Body.Close()
-
-	responseBody, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		return nil, fmt.Errorf("could not read response body: %v", err)
 	}
 
 	var ipInfo IPInfo
-	if err := json.Unmarshal(responseBody, &ipInfo); err != nil {
+	if err := json.Unmarshal(resp.Body(), &ipInfo); err != nil {
 		return nil, fmt.Errorf("could not unmarshal response body: %v", err)
 	}
 
 	return &ipInfo, nil
+}
+
+func prepareHeaders(userAgent string) *fasthttp.RequestHeader {
+	headers := &fasthttp.RequestHeader{}
+	headers.SetUserAgent(userAgent)
+	headers.Set("pragma", "no-cache")
+	headers.Set("Accept-Language", "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7")
+	headers.Set("Cache-Control", "no-cache")
+	return headers
+}
+
+func createProxyDialerWithFastHTTP(proxyAddr string) func(*http.Request) (*url.URL, error) {
+	return func(*http.Request) (*url.URL, error) {
+		if strings.HasPrefix(proxyAddr, "socks5://") {
+			return url.Parse(proxyAddr)
+		} else if strings.HasPrefix(proxyAddr, "http://") {
+			return url.Parse(proxyAddr)
+		}
+		return url.Parse("socks5://" + proxyAddr)
+	}
 }
 
 func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, proxyIP string) {
@@ -233,9 +276,7 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 						"user_agent":  userAgent,
 						"timestamp":   time.Now().Unix(),
 						"device_type": "desktop",
-						//"device_type":  "extension",
-						//"extension_id": "lkbnfiajjmbhnfledhphioinpickokdi",
-						"version": "4.28.1",
+						"version":     "4.28.1",
 					},
 				}
 				if err := c.WriteJSON(authResponse); err != nil {
@@ -259,41 +300,23 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 }
 
 func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) error {
-	var proxyURL *url.URL
-	var err error
-
-	if strings.HasPrefix(proxy, "socks5://") {
-		proxyURL, err = url.Parse(proxy)
-	} else if strings.HasPrefix(proxy, "http://") {
-		proxyURL, err = url.Parse(proxy)
-	} else {
-		proxyURL, err = url.Parse("socks5://" + proxy)
-	}
-
-	if err != nil {
-		return fmt.Errorf("error parsing proxy URL: %v", err)
-	}
-
 	deviceID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte(proxy)).String()
 	userAgent := browser.Random()
 
-	u := url.URL{Scheme: "wss", Host: ws.config.WSSHost, Path: "/"}
-	ws.logger.Info(fmt.Sprintf("Connecting to %s", u.String()))
+	wsURL := fmt.Sprintf("wss://%s/", ws.config.WSSHost)
+	ws.logger.Info(fmt.Sprintf("Connecting to %s", wsURL))
+
+	headers := prepareHeaders(userAgent)
 
 	dialer := websocket.Dialer{
-		Proxy:            http.ProxyURL(proxyURL),
+		Proxy:            createProxyDialerWithFastHTTP(proxy),
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
 		HandshakeTimeout: 30 * time.Second,
 	}
 
-	headers := http.Header{}
-	headers.Set("User-Agent", userAgent)
-	headers.Set("pragma", "no-cache")
-	//headers.Set("Origin", "chrome-extension://lkbnfiajjmbhnfledhphioinpickokdi")
-	headers.Set("Accept-Language", "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7")
-	headers.Set("Cache-Control", "no-cache")
+	httpHeaders := fastHTTPHeadersToHTTP(headers)
 
-	c, _, err := dialer.DialContext(ctx, u.String(), headers)
+	c, _, err := dialer.DialContext(ctx, wsURL, httpHeaders)
 	if err != nil {
 		return fmt.Errorf("error connecting to WebSocket: %v", err)
 	}
@@ -378,17 +401,6 @@ func readLines(filename string) ([]string, error) {
 	}
 
 	return lines, scanner.Err()
-}
-
-func normalizeProxy(proxy string) string {
-	proxy = strings.TrimSpace(proxy)
-	if strings.HasPrefix(proxy, "http://") {
-		return strings.TrimPrefix(proxy, "http://")
-	}
-	if strings.HasPrefix(proxy, "socks5://") {
-		return strings.TrimPrefix(proxy, "socks5://")
-	}
-	return proxy
 }
 
 func main() {
