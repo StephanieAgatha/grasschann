@@ -35,7 +35,7 @@ go.uber.org/zap
 git clone https://github.com/StephanieAgatha/grasschann
 
 # Change directory
-cd grass-bot
+cd grasschann
 
 # Install dependencies
 go mod tidy
