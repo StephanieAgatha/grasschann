@@ -33,6 +33,9 @@ const (
 	defaultRetryAttempts       = 3
 	defaultCacheDuration       = 5 * time.Minute
 	defaultCacheCleanup        = 10 * time.Minute
+	maxRetries                 = 10
+	baseRetryDelay             = 5 * time.Second
+	maxRetryDelay              = 30 * time.Second
 )
 
 type Config struct {
@@ -232,18 +235,6 @@ func (p *FastHTTPClientPool) Put(c *fasthttp.Client) {
 	p.pool.Put(c)
 }
 
-func (p *FastHTTPClientPool) GetMetrics() Metrics {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-
-	return Metrics{
-		ActiveConnections: atomic.LoadInt32(&p.metrics.ActiveConnections),
-		TotalRequests:     atomic.LoadInt64(&p.metrics.TotalRequests),
-		FailedRequests:    atomic.LoadInt64(&p.metrics.FailedRequests),
-		ResponseTimes:     append([]time.Duration{}, p.metrics.ResponseTimes...), //copy slice
-	}
-}
-
 func (p *FastHTTPClientPool) AddResponseTime(duration time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -416,9 +407,17 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 		case <-ctx.Done():
 			return
 		default:
+			//read deadline
+			if err := c.SetReadDeadline(time.Now().Add(35 * time.Second)); err != nil {
+				ws.logger.Error("Failed to set read deadline", zap.Error(err))
+				return
+			}
+
 			_, message, err := c.ReadMessage()
 			if err != nil {
-				ws.logger.Error(fmt.Sprintf("Error reading message: %v", err))
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					ws.logger.Error(fmt.Sprintf("Error reading message: %v", err))
+				}
 				return
 			}
 
@@ -465,6 +464,48 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 }
 
 func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) error {
+	retryCount := 0
+	for {
+		err := ws.attemptConnection(ctx, proxy, userID)
+		if err != nil {
+			retryCount++
+			if retryCount > maxRetries {
+				ws.logger.Error("Max retries reached",
+					zap.String("userID", userID),
+					zap.String("proxy", proxy),
+					zap.Error(err))
+				retryCount = 0
+				time.Sleep(maxRetryDelay)
+				continue
+			}
+
+			//calculate delay with exponential backoff
+			delay := baseRetryDelay * time.Duration(1<<uint(retryCount))
+			if delay > maxRetryDelay {
+				delay = maxRetryDelay
+			}
+
+			ws.logger.Warn("Connection failed, retrying",
+				zap.String("userID", userID),
+				zap.String("proxy", proxy),
+				zap.Duration("delay", delay),
+				zap.Int("retry", retryCount),
+				zap.Error(err))
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(delay):
+				continue
+			}
+		}
+
+		// Reset retry count on successful connection
+		retryCount = 0
+	}
+}
+
+func (ws *DefaultWSClient) attemptConnection(ctx context.Context, proxy, userID string) error {
 	deviceID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte(proxy)).String()
 	userAgent := browser.MacOSX()
 
@@ -483,7 +524,7 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 		Proxy:            createProxyDialerWithFastHTTP(proxy),
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
 		HandshakeTimeout: defaultReadTimeout,
-		WriteBufferSize:  4096, // Optimized buffer size
+		WriteBufferSize:  4096,
 		ReadBufferSize:   4096,
 	}
 
@@ -499,8 +540,10 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 	}()
 
 	c.EnableWriteCompression(true)
-	c.SetReadLimit(32 << 20) // 32MB max message size
+	c.SetReadLimit(32 << 20)
+	c.SetReadDeadline(time.Now().Add(35 * time.Second))
 
+	errChan := make(chan error, 2)
 	done := make(chan struct{})
 	defer close(done)
 
@@ -508,6 +551,7 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 		defer func() {
 			if r := recover(); r != nil {
 				ws.logger.Error("Panic in ping handler", zap.Any("error", r))
+				errChan <- fmt.Errorf("ping handler panic: %v", r)
 			}
 		}()
 		ws.sendPing(ctx, c, ipInfo.IP)
@@ -517,13 +561,18 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 		defer func() {
 			if r := recover(); r != nil {
 				ws.logger.Error("Panic in message handler", zap.Any("error", r))
+				errChan <- fmt.Errorf("message handler panic: %v", r)
 			}
 		}()
 		ws.handleMessages(ctx, c, ipInfo, deviceID, userID)
 	}()
 
-	<-ctx.Done()
-	return ctx.Err()
+	select {
+	case err := <-errChan:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (pd *ProxyDistributor) Validate() error {
@@ -580,7 +629,6 @@ func (pc *DefaultProxyChecker) normalizeProxyURL(proxy string) string {
 		return proxy
 	}
 
-	// Parse proxy parts
 	var proxyURL ProxyURL
 
 	// Split credentials and host
@@ -606,7 +654,6 @@ func (pc *DefaultProxyChecker) normalizeProxyURL(proxy string) string {
 		}
 	}
 
-	// Build URL
 	var builder strings.Builder
 	builder.WriteString("socks5://")
 
