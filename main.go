@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -414,6 +416,12 @@ func main() {
 	logger := initLogger()
 	defer logger.Sync()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+
 	proxies, err := readLines("proxy.txt")
 	if err != nil {
 		logger.Fatal("Error reading proxies", zap.Error(err))
@@ -434,24 +442,64 @@ func main() {
 	bot := NewBot(config, logger)
 	var wg sync.WaitGroup
 
-	for userID, userProxies := range proxyDistribution {
-		for _, proxy := range userProxies {
-			wg.Add(1)
-			go func(proxy, userID string) {
-				defer wg.Done()
-				for {
-					if err := bot.wsClient.Connect(context.Background(), proxy, userID); err != nil {
-						logger.Error("Connection error",
-							zap.Error(err),
-							zap.String("userID", userID),
-							zap.String("proxy", proxy))
-						time.Sleep(config.RetryInterval)
-						continue
+	done := make(chan struct{})
+
+	go func() {
+		for userID, userProxies := range proxyDistribution {
+			for _, proxy := range userProxies {
+				wg.Add(1)
+				go func(proxy, userID string) {
+					defer wg.Done()
+					for {
+						select {
+						case <-ctx.Done():
+							logger.Info("Shutting down connection",
+								zap.String("userID", userID),
+								zap.String("proxy", proxy))
+							return
+						default:
+							if err := bot.wsClient.Connect(ctx, proxy, userID); err != nil {
+								logger.Error("Connection error",
+									zap.Error(err),
+									zap.String("userID", userID),
+									zap.String("proxy", proxy))
+								select {
+								case <-ctx.Done():
+									return
+								case <-time.After(config.RetryInterval):
+									continue
+								}
+							}
+						}
 					}
-				}
-			}(proxy, userID)
+				}(proxy, userID)
+			}
 		}
+		wg.Wait()
+		close(done)
+	}()
+
+	//handle shutdown
+	select {
+	case sig := <-signals:
+		logger.Info("Received shutdown signal", zap.String("signal", sig.String()))
+		cancel()
+		//wait for graceful shutdown with timeout
+		shutdownTimeout := time.NewTimer(30 * time.Second)
+		select {
+		case <-done:
+			logger.Info("All connections closed successfully")
+		case <-shutdownTimeout.C:
+			logger.Warn("Shutdown timed out, forcing exit")
+		}
+
+		//final cleanup
+		logger.Info("Cleaning up resources")
+		time.Sleep(2 * time.Second) //give time for final cleanup
+
+	case <-done:
+		logger.Info("All connections finished naturally")
 	}
 
-	wg.Wait()
+	logger.Info("Program exiting")
 }
