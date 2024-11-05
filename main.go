@@ -13,7 +13,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,31 +20,6 @@ import (
 	"github.com/itzngga/fake-useragent"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-)
-
-const (
-	defaultMaxConnsPerHost     = 1000
-	defaultReadTimeout         = 30 * time.Second
-	defaultWriteTimeout        = 30 * time.Second
-	defaultMaxIdleConnDuration = 5 * time.Minute
-	defaultMaxConnDuration     = 10 * time.Minute
-	defaultMaxConnWaitTimeout  = 30 * time.Second
-	defaultRetryAttempts       = 3
-	defaultCacheDuration       = 5 * time.Minute
-	defaultCacheCleanup        = 10 * time.Minute
-	maxRetries                 = 10
-	baseRetryDelay             = 5 * time.Second
-	maxRetryDelay              = 30 * time.Second
-	pingInterval               = 26 * time.Second
-	readDeadline               = 50 * time.Second
-	writeDeadline              = 20 * time.Second
-	pongWait                   = 30 * time.Second
-	statsInterval              = 1 * time.Minute
-)
-
-var (
-	globalStats *StatsManager
-	once        sync.Once
 )
 
 type Config struct {
@@ -78,51 +52,16 @@ type DefaultWSClient struct {
 type DefaultProxyChecker struct {
 	config     Config
 	clientPool *FastHTTPClientPool
-	cache      *ProxyCache
-}
-
-type cacheEntry struct {
-	data      *IPInfo
-	timestamp time.Time
-}
-
-type ProxyCache struct {
-	data  sync.Map
-	ttl   time.Duration
-	mutex sync.RWMutex
 }
 
 type FastHTTPClientPool struct {
-	pool    sync.Pool
-	metrics *Metrics
-	mu      sync.RWMutex
+	pool sync.Pool
 }
 
 type ProxyDistributor struct {
 	userIDs []string
 	proxies []string
 	logger  *zap.Logger
-}
-
-type Metrics struct {
-	ActiveConnections int32
-	TotalRequests     int64
-	FailedRequests    int64
-	ResponseTimes     []time.Duration
-}
-
-type ProxyURL struct {
-	Scheme   string
-	Username string
-	Password string
-	Host     string
-	Port     string
-}
-
-type StatsManager struct {
-	successCount int32
-	mu           sync.RWMutex
-	logger       *zap.Logger
 }
 
 type WSClient interface {
@@ -133,9 +72,16 @@ type ProxyChecker interface {
 	GetProxyIP(proxy string) (*IPInfo, error)
 }
 
+func (p *FastHTTPClientPool) Get() *fasthttp.Client {
+	return p.pool.Get().(*fasthttp.Client)
+}
+
+func (p *FastHTTPClientPool) Put(c *fasthttp.Client) {
+	p.pool.Put(c)
+}
+
 func NewBot(config Config, logger *zap.Logger) *Bot {
 	proxyChecker := NewDefaultProxyChecker(config)
-	initStatsManager(logger) //init global stats manager
 	return &Bot{
 		config:     config,
 		logger:     logger,
@@ -152,22 +98,10 @@ func NewDefaultWSClient(config Config, logger *zap.Logger, proxyCheck ProxyCheck
 	}
 }
 
-func NewProxyCache(ttl time.Duration) *ProxyCache {
-	cache := &ProxyCache{
-		ttl: ttl,
-	}
-
-	//start cleanup routine
-	go cache.cleanup()
-
-	return cache
-}
-
 func NewDefaultProxyChecker(config Config) *DefaultProxyChecker {
 	return &DefaultProxyChecker{
 		config:     config,
 		clientPool: NewFastHTTPClientPool(),
-		cache:      NewProxyCache(defaultCacheDuration),
 	}
 }
 
@@ -176,127 +110,15 @@ func NewFastHTTPClientPool() *FastHTTPClientPool {
 		pool: sync.Pool{
 			New: func() interface{} {
 				return &fasthttp.Client{
-					MaxConnsPerHost:               defaultMaxConnsPerHost,
-					ReadTimeout:                   defaultReadTimeout,
-					WriteTimeout:                  defaultWriteTimeout,
-					MaxIdleConnDuration:           defaultMaxIdleConnDuration,
-					MaxConnDuration:               defaultMaxConnDuration,
-					MaxConnWaitTimeout:            defaultMaxConnWaitTimeout,
-					NoDefaultUserAgentHeader:      true,             //reduce memory alloc
-					DisableHeaderNamesNormalizing: true,             //optimize perform
-					DisablePathNormalizing:        true,             //optimize perform
-					MaxResponseBodySize:           30 * 1024 * 1024, //30MB max response
-					MaxIdemponentCallAttempts:     defaultRetryAttempts,
+					MaxConnsPerHost:     1000,
+					ReadTimeout:         30 * time.Second,
+					WriteTimeout:        30 * time.Second,
+					MaxIdleConnDuration: 5 * time.Minute,
+					MaxConnDuration:     10 * time.Minute,
+					MaxConnWaitTimeout:  30 * time.Second,
 				}
 			},
 		},
-		metrics: &Metrics{
-			ResponseTimes: make([]time.Duration, 0, 1000), //pre-allocate slice
-		},
-	}
-}
-
-// get gets value from cache
-func (c *ProxyCache) Get(key string) (*IPInfo, bool) {
-	value, exists := c.data.Load(key)
-	if !exists {
-		return nil, false
-	}
-
-	entry := value.(*cacheEntry)
-
-	//check if entry is expired
-	if time.Since(entry.timestamp) > c.ttl {
-		c.data.Delete(key)
-		return nil, false
-	}
-
-	return entry.data, true
-}
-
-// set sets value in cache
-func (c *ProxyCache) Set(key string, value *IPInfo) {
-	c.data.Store(key, &cacheEntry{
-		data:      value,
-		timestamp: time.Now(),
-	})
-}
-
-// cleanup removes expired entries
-func (c *ProxyCache) cleanup() {
-	ticker := time.NewTicker(defaultCacheCleanup)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		c.data.Range(func(key, value interface{}) bool {
-			entry := value.(*cacheEntry)
-			if time.Since(entry.timestamp) > c.ttl {
-				c.data.Delete(key)
-			}
-			return true
-		})
-	}
-}
-
-func (p *FastHTTPClientPool) Get() *fasthttp.Client {
-	atomic.AddInt32(&p.metrics.ActiveConnections, 1)
-	client := p.pool.Get().(*fasthttp.Client)
-	return client
-}
-
-func (p *FastHTTPClientPool) Put(c *fasthttp.Client) {
-	c.Dial = nil
-	c.TLSConfig = nil
-
-	atomic.AddInt32(&p.metrics.ActiveConnections, -1)
-	p.pool.Put(c)
-}
-
-func initStatsManager(logger *zap.Logger) *StatsManager {
-	once.Do(func() {
-		globalStats = &StatsManager{
-			logger: logger,
-		}
-		//start single stats reporter
-		go globalStats.reportStats()
-	})
-	return globalStats
-}
-
-func (sm *StatsManager) increment() {
-	atomic.AddInt32(&sm.successCount, 1)
-}
-
-func (sm *StatsManager) decrement() {
-	atomic.AddInt32(&sm.successCount, -1)
-}
-
-func (sm *StatsManager) getCount() int32 {
-	return atomic.LoadInt32(&sm.successCount)
-}
-
-func (sm *StatsManager) reportStats() {
-	ticker := time.NewTicker(statsInterval)
-	defer ticker.Stop()
-
-	for range ticker.C {
-		count := sm.getCount()
-		sm.logger.Info(fmt.Sprintf("Active connections: %d proxies successfully sent ping",
-			count),
-			zap.Int32("active_proxies", count),
-			zap.String("status", "active"))
-	}
-}
-
-func (p *FastHTTPClientPool) AddResponseTime(duration time.Duration) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	p.metrics.ResponseTimes = append(p.metrics.ResponseTimes, duration)
-
-	//keep only last 1000 response times
-	if len(p.metrics.ResponseTimes) > 1000 {
-		p.metrics.ResponseTimes = p.metrics.ResponseTimes[1:]
 	}
 }
 
@@ -346,64 +168,39 @@ func initLogger() *zap.Logger {
 }
 
 func (pc *DefaultProxyChecker) GetProxyIP(proxy string) (*IPInfo, error) {
-	// Check cache first
-	if cached, exists := pc.cache.Get(proxy); exists {
-		return cached, nil
+	var proxyURL string
+	if strings.HasPrefix(proxy, "socks5://") {
+		proxyURL = proxy
+	} else if strings.HasPrefix(proxy, "http://") {
+		proxyURL = proxy
+	} else {
+		proxyURL = "socks5://" + proxy
 	}
 
-	start := time.Now()
-	proxyURL := pc.normalizeProxyURL(proxy)
-
 	client := pc.clientPool.Get()
-	defer func() {
-		pc.clientPool.Put(client)
-		pc.clientPool.AddResponseTime(time.Since(start))
-	}()
-
 	client.Dial = fasthttpproxy.FasthttpSocksDialer(proxyURL)
 	client.TLSConfig = &tls.Config{
 		InsecureSkipVerify: true,
 	}
+	defer pc.clientPool.Put(client)
 
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 
 	req.SetRequestURI(pc.config.IPCheckURL)
-	req.Header.SetMethod(fasthttp.MethodGet)
+	req.Header.SetMethod("GET")
 
 	resp := fasthttp.AcquireResponse()
 	defer fasthttp.ReleaseResponse(resp)
 
-	var err error
-	for i := 0; i < defaultRetryAttempts; i++ {
-		err = client.DoTimeout(req, resp, defaultReadTimeout)
-		if err == nil {
-			break
-		}
-
-		if i < defaultRetryAttempts-1 {
-			time.Sleep(time.Duration(1<<uint(i)) * time.Second)
-		}
-	}
-
-	if err != nil {
-		atomic.AddInt64(&pc.clientPool.metrics.FailedRequests, 1)
-		return nil, fmt.Errorf("request failed after %d attempts: %w", defaultRetryAttempts, err)
-	}
-
-	atomic.AddInt64(&pc.clientPool.metrics.TotalRequests, 1)
-
-	if resp.StatusCode() != fasthttp.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode())
+	if err := client.DoTimeout(req, resp, 30*time.Second); err != nil {
+		return nil, fmt.Errorf("failed to perform GET request: %v", err)
 	}
 
 	var ipInfo IPInfo
 	if err := json.Unmarshal(resp.Body(), &ipInfo); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, fmt.Errorf("could not unmarshal response body: %v", err)
 	}
-
-	//set cache
-	pc.cache.Set(proxy, &ipInfo)
 
 	return &ipInfo, nil
 }
@@ -428,40 +225,24 @@ func createProxyDialerWithFastHTTP(proxyAddr string) func(*http.Request) (*url.U
 	}
 }
 
-func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, proxyIP string, proxy string) {
-	pingTicker := time.NewTicker(pingInterval)
-	defer pingTicker.Stop()
-
-	globalStats.increment()
-	defer globalStats.decrement()
+func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, proxyIP string) {
+	ticker := time.NewTicker(26 * time.Second)
+	defer ticker.Stop()
 
 	for {
 		select {
-		case <-pingTicker.C:
-			if err := c.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
-				ws.logger.Error("Failed to set write deadline",
-					zap.Error(err),
-					zap.String("ip", proxyIP))
-				ws.logger.Info("Failed proxy info", zap.String("proxy", proxy))
-				return
-			}
-
+		case <-ticker.C:
 			message := map[string]interface{}{
 				"id":      uuid.New().String(),
 				"version": "1.0.0",
 				"action":  "PING",
 				"data":    map[string]interface{}{},
 			}
-
 			if err := c.WriteJSON(message); err != nil {
-				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					ws.logger.Error("Error sending ping", zap.Error(err))
-					ws.logger.Info("Failed proxy info", zap.String("proxy", proxy))
-				}
+				ws.logger.Error(fmt.Sprintf("Error sending ping: %v", err))
 				return
 			}
 			ws.logger.Info(fmt.Sprintf("Sent ping - IP: %s, Message: %v", proxyIP, message))
-
 		case <-ctx.Done():
 			return
 		}
@@ -469,7 +250,7 @@ func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, prox
 }
 
 func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn, ipInfo *IPInfo, deviceID, userID string) {
-	userAgent := browser.MacOSX()
+	userAgent := browser.Random()
 
 	for {
 		select {
@@ -478,12 +259,7 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 		default:
 			_, message, err := c.ReadMessage()
 			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					ws.logger.Error("Read error",
-						zap.Error(err),
-						zap.String("userID", userID),
-						zap.String("ip", ipInfo.IP))
-				}
+				ws.logger.Error(fmt.Sprintf("Error reading message: %v", err))
 				return
 			}
 
@@ -493,13 +269,7 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 				continue
 			}
 
-			//log received msg
 			ws.logger.Info(fmt.Sprintf("Received message from IP %s: %v", ipInfo.IP, msg))
-
-			if err := c.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
-				ws.logger.Error("Failed to set write deadline", zap.Error(err))
-				return
-			}
 
 			switch msg["action"].(string) {
 			case "AUTH":
@@ -516,22 +286,17 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 					},
 				}
 				if err := c.WriteJSON(authResponse); err != nil {
-					ws.logger.Error("Error sending auth response",
-						zap.Error(err),
-						zap.String("ip", ipInfo.IP))
+					ws.logger.Error(fmt.Sprintf("Error sending auth response: %v", err))
 					return
 				}
 				ws.logger.Info(fmt.Sprintf("Sent auth response - IP: %s, Response: %v", ipInfo.IP, authResponse))
-
 			case "PONG":
 				pongResponse := map[string]interface{}{
 					"id":            msg["id"].(string),
 					"origin_action": "PONG",
 				}
 				if err := c.WriteJSON(pongResponse); err != nil {
-					ws.logger.Error("Error sending pong response",
-						zap.Error(err),
-						zap.String("ip", ipInfo.IP))
+					ws.logger.Error(fmt.Sprintf("Error sending pong response: %v", err))
 					return
 				}
 				ws.logger.Info(fmt.Sprintf("Sent pong response - IP: %s, Response: %v", ipInfo.IP, pongResponse))
@@ -541,134 +306,41 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 }
 
 func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) error {
-	retryCount := 0
-	for {
-		err := ws.attemptConnection(ctx, proxy, userID)
-		if err != nil {
-			retryCount++
-			if retryCount > maxRetries {
-				ws.logger.Error("Max retries reached",
-					zap.String("userID", userID),
-					zap.String("proxy", proxy),
-					zap.Error(err))
-				retryCount = 0
-				time.Sleep(maxRetryDelay)
-				continue
-			}
-
-			//calculate delay with exponential backoff
-			delay := baseRetryDelay * time.Duration(1<<uint(retryCount))
-			if delay > maxRetryDelay {
-				delay = maxRetryDelay
-			}
-
-			ws.logger.Warn("Connection failed, retrying",
-				zap.String("userID", userID),
-				zap.String("proxy", proxy),
-				zap.Duration("delay", delay),
-				zap.Int("retry", retryCount),
-				zap.Error(err))
-
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-				continue
-			}
-		}
-
-		// Reset retry count on successful connection
-		retryCount = 0
-	}
-}
-
-func (ws *DefaultWSClient) attemptConnection(ctx context.Context, proxy, userID string) error {
 	deviceID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte(proxy)).String()
-	userAgent := browser.MacOSX()
-
-	ipInfo, err := ws.proxyCheck.GetProxyIP(proxy)
-	if err != nil {
-		return fmt.Errorf("proxy check failed: %w", err)
-	}
+	userAgent := browser.Random()
 
 	wsURL := fmt.Sprintf("wss://%s/", ws.config.WSSHost)
-	ws.logger.Info(fmt.Sprintf("Connecting to %s using IP %s", wsURL, ipInfo.IP))
+	ws.logger.Info(fmt.Sprintf("Connecting to %s", wsURL))
 
 	headers := prepareHeaders(userAgent)
-	httpHeaders := fastHTTPHeadersToHTTP(headers)
 
 	dialer := websocket.Dialer{
 		Proxy:            createProxyDialerWithFastHTTP(proxy),
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
-		HandshakeTimeout: defaultReadTimeout,
-		WriteBufferSize:  4096,
-		ReadBufferSize:   4096,
+		HandshakeTimeout: 30 * time.Second,
 	}
+
+	httpHeaders := fastHTTPHeadersToHTTP(headers)
 
 	c, _, err := dialer.DialContext(ctx, wsURL, httpHeaders)
 	if err != nil {
-		return fmt.Errorf("websocket connection failed: %w", err)
+		return fmt.Errorf("error connecting to WebSocket: %v", err)
 	}
+	defer c.Close()
 
-	defer func() {
-		c.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		c.Close()
-	}()
+	ws.logger.Info("Connected to WebSocket")
 
-	c.EnableWriteCompression(true)
-	c.SetReadLimit(32 << 20)
-
-	// ping handler
-	c.SetPingHandler(func(message string) error {
-		err := c.SetReadDeadline(time.Now().Add(readDeadline))
-		if err != nil {
-			return err
-		}
-		return c.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(writeDeadline))
-	})
-
-	// pong handler
-	c.SetPongHandler(func(string) error {
-		return c.SetReadDeadline(time.Now().Add(pongWait))
-	})
-
-	// read deadline
-	err = c.SetReadDeadline(time.Now().Add(readDeadline))
+	ipInfo, err := ws.proxyCheck.GetProxyIP(proxy)
 	if err != nil {
-		return fmt.Errorf("set initial deadline failed: %w", err)
+		return fmt.Errorf("error getting proxy IP info: %v", err)
 	}
+	ws.logger.Info(fmt.Sprintf("Proxy location info - IP: %s, City: %s, Region: %s",
+		ipInfo.IP, ipInfo.City, ipInfo.Region))
 
-	errChan := make(chan error, 2)
-	done := make(chan struct{})
-	defer close(done)
+	go ws.sendPing(ctx, c, ipInfo.IP)
+	ws.handleMessages(ctx, c, ipInfo, deviceID, userID)
 
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				ws.logger.Error("Panic in ping handler", zap.Any("error", r))
-				errChan <- fmt.Errorf("ping handler panic: %v", r)
-			}
-		}()
-		ws.sendPing(ctx, c, ipInfo.IP, proxy)
-	}()
-
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				ws.logger.Error("Panic in message handler", zap.Any("error", r))
-				errChan <- fmt.Errorf("message handler panic: %v", r)
-			}
-		}()
-		ws.handleMessages(ctx, c, ipInfo, deviceID, userID)
-	}()
-
-	select {
-	case err := <-errChan:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return nil
 }
 
 func (pd *ProxyDistributor) Validate() error {
@@ -713,62 +385,6 @@ func NewProxyDistributor(userIDs, proxies []string, logger *zap.Logger) *ProxyDi
 		proxies: proxies,
 		logger:  logger,
 	}
-}
-
-// normalizeProxyURL normalizes and validates proxy URL
-func (pc *DefaultProxyChecker) normalizeProxyURL(proxy string) string {
-	// Remove whitespace
-	proxy = strings.TrimSpace(proxy)
-
-	// If already has scheme, return as is
-	if strings.HasPrefix(proxy, "socks5://") || strings.HasPrefix(proxy, "http://") {
-		return proxy
-	}
-
-	var proxyURL ProxyURL
-
-	// Split credentials and host
-	parts := strings.Split(proxy, "@")
-	if len(parts) == 2 {
-		// Has credentials
-		creds := strings.Split(parts[0], ":")
-		if len(creds) == 2 {
-			proxyURL.Username = creds[0]
-			proxyURL.Password = creds[1]
-		}
-		hostPort := strings.Split(parts[1], ":")
-		if len(hostPort) == 2 {
-			proxyURL.Host = hostPort[0]
-			proxyURL.Port = hostPort[1]
-		}
-	} else {
-		// No credentials
-		hostPort := strings.Split(proxy, ":")
-		if len(hostPort) == 2 {
-			proxyURL.Host = hostPort[0]
-			proxyURL.Port = hostPort[1]
-		}
-	}
-
-	var builder strings.Builder
-	builder.WriteString("socks5://")
-
-	if proxyURL.Username != "" {
-		builder.WriteString(url.QueryEscape(proxyURL.Username))
-		if proxyURL.Password != "" {
-			builder.WriteString(":")
-			builder.WriteString(url.QueryEscape(proxyURL.Password))
-		}
-		builder.WriteString("@")
-	}
-
-	builder.WriteString(proxyURL.Host)
-	if proxyURL.Port != "" {
-		builder.WriteString(":")
-		builder.WriteString(proxyURL.Port)
-	}
-
-	return builder.String()
 }
 
 func readLines(filename string) ([]string, error) {
