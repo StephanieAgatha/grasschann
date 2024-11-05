@@ -428,11 +428,10 @@ func createProxyDialerWithFastHTTP(proxyAddr string) func(*http.Request) (*url.U
 	}
 }
 
-func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, proxyIP string) {
+func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, proxyIP string, proxy string) {
 	pingTicker := time.NewTicker(pingInterval)
 	defer pingTicker.Stop()
 
-	//increment counter when starting ping
 	globalStats.increment()
 	defer globalStats.decrement()
 
@@ -443,6 +442,7 @@ func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, prox
 				ws.logger.Error("Failed to set write deadline",
 					zap.Error(err),
 					zap.String("ip", proxyIP))
+				ws.logger.Info("Failed proxy info", zap.String("proxy", proxy))
 				return
 			}
 
@@ -455,9 +455,8 @@ func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, prox
 
 			if err := c.WriteJSON(message); err != nil {
 				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
-					ws.logger.Error("Error sending ping",
-						zap.Error(err),
-						zap.String("ip", proxyIP))
+					ws.logger.Error("Error sending ping", zap.Error(err))
+					ws.logger.Info("Failed proxy info", zap.String("proxy", proxy))
 				}
 				return
 			}
@@ -651,7 +650,7 @@ func (ws *DefaultWSClient) attemptConnection(ctx context.Context, proxy, userID 
 				errChan <- fmt.Errorf("ping handler panic: %v", r)
 			}
 		}()
-		ws.sendPing(ctx, c, ipInfo.IP)
+		ws.sendPing(ctx, c, ipInfo.IP, proxy)
 	}()
 
 	go func() {

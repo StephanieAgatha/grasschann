@@ -1,49 +1,17 @@
-# Grass Bot - WebSocket Proxy Manager
+# Grass Bot
 
-A high-performance WebSocket proxy manager written in Go, designed for handling multiple proxy connections with efficient resource management.
+A high-performance WebSocket proxy manager written in Go, designed for handling multiple proxy connections with efficient resource management and automatic reconnection capabilities.
 
 ## Features
 
-- Multiple proxy support per user ID
-- Automated proxy rotation and distribution
-- Real-time WebSocket communication
+- Multiple proxy support per user ID with automatic distribution
 - IP geolocation checking
-- Efficient connection pooling
-- Colorized logging with timezone support
-
-## Core Components
-
-1. **Connection Pool Management**
-   ```go
-   - FastHTTPClientPool: Manages HTTP client connections
-   - Connection metrics tracking
-   - Configurable timeouts and retry attempts
-   - Memory-efficient pooling implementation
-   ```
-
-2. **Proxy Handling**
-   ```go
-   - Proxy URL normalization
-   - Supports SOCKS5 and HTTP proxies
-   - Credential handling
-   - Distribution system for multiple users
-   ```
-
-3. **Caching System**
-   ```go
-   - TTL-based caching for IP info (5m duration)
-   - Automatic cleanup mechanism (10m interval)
-   - Thread-safe operations
-   - Memory-efficient storage
-   ```
-
-4. **WebSocket Management**
-   ```go
-   - Ping/Pong mechanism (26s interval)
-   - Write compression enabled
-   - Optimized buffer sizes (4096 bytes)
-   - Maximum message size (32MB)
-   ```
+- Real-time WebSocket communication with ping/pong mechanism
+- Connection pooling with FastHTTP for optimal performance
+- Exponential backoff retry mechanism
+- Active connection monitoring
+- Colorized logging with Asia/Jakarta timezone
+- Memory-efficient connection management
 
 ## Prerequisites
 
@@ -73,12 +41,14 @@ cd grasschann
 
 # Install dependencies
 go mod tidy
+
+# Run the application
+go run main.go
 ```
 
 ## Configuration
 
-Create the following files in your project directory:
-
+### Files Setup
 1. `proxy.txt` - List of proxies, one per line:
 ```
 socks5://user:pass@host:port
@@ -92,33 +62,7 @@ user-id-1
 user-id-2
 ```
 
-## Performance Optimizations
-
-1. **Memory Usage**
-   ```go
-   - Connection pooling with sync.Pool
-   - Request/Response pooling
-   - Pre-allocated response time slices
-   - Disabled default headers
-   ```
-
-2. **Network Efficiency**
-   ```go
-   - FastHTTP implementation
-   - Connection reuse
-   - Compression enabled
-   - Buffer optimization
-   ```
-
-3. **Error Resilience**
-   ```go
-   - Exponential backoff retry
-   - Panic recovery
-   - Graceful shutdowns
-   - Context cancellation support
-   ```
-
-## Technical Configuration
+### Connection Parameters
 
 ```go
 MaxConnsPerHost:      1000
@@ -127,50 +71,58 @@ WriteTimeout:         30s
 MaxIdleConnDuration:  5m
 MaxConnDuration:      10m
 MaxConnWaitTimeout:   30s
-RetryInterval:        20s
-CacheDuration:        5m
-CacheCleanup:         10m
-RetryAttempts:        3
-BufferSize:          4096
-MaxMessageSize:       32MB
+PingInterval:         26s
+ReadDeadline:        50s
+WriteDeadline:       20s
 ```
 
-## Project Structure
-
-```
-├── main.go                # Main application entry
-├── proxy.txt              # Proxy list file
-├── uid.txt                # User ID list file
-└── README.md              # Documentation
-```
-
-## Usage
-
-```bash
-# Run the application
-go run main.go
+### Retry Mechanism
+```go
+MaxRetries:          10
+BaseRetryDelay:      5s
+MaxRetryDelay:       30s
+RetryInterval:       20s
 ```
 
-## Logging
+### Cache Settings
+```go
+CacheDuration:       5m
+CacheCleanup:        10m
+```
 
-The application uses Zap logger with:
-- Colorized output
-- Asia/Jakarta timezone support
-- Structured logging format
-- Error tracking with stack traces
-- Connection status monitoring
-- Request/Response metrics
+## Key Features
 
-## Error Handling
+### 1. Connection Pool Management
+- FastHTTP client pooling
+- Memory-efficient resource utilization
+- Connection reuse optimization
+- Automatic cleanup of idle connections
 
-The application implements comprehensive error handling:
+### 2. Proxy Handling
+- Support for both SOCKS5 and HTTP proxies
+- Automatic proxy URL normalization
+- Proxy health monitoring
+- Even distribution among users
+
+### 3. Error Handling
+- Exponential backoff retry mechanism
 - Automatic reconnection on failure
-- Configurable retry intervals with exponential backoff
-- Detailed error logging with stack traces
-- Connection timeout management
 - Panic recovery in goroutines
-- Context cancellation handling
+- Comprehensive error logging
 
+### 4. Performance Optimization
+- FastHTTP for reduced memory allocation
+- Connection pooling and reuse
+- Write compression enabled
+- Optimized buffer sizes
+- Efficient proxy distribution
+
+### 5. Monitoring
+- Active connection tracking
+- Real-time connection status
+- Detailed error logging
+- Response time monitoring
+- Proxy health statistics
 ## License
 
 This project is licensed under the MIT License - see the LICENSE file for details.
