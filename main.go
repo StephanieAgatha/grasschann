@@ -36,6 +36,16 @@ const (
 	maxRetries                 = 10
 	baseRetryDelay             = 5 * time.Second
 	maxRetryDelay              = 30 * time.Second
+	pingInterval               = 26 * time.Second
+	readDeadline               = 50 * time.Second
+	writeDeadline              = 20 * time.Second
+	pongWait                   = 30 * time.Second
+	statsInterval              = 1 * time.Minute
+)
+
+var (
+	globalStats *StatsManager
+	once        sync.Once
 )
 
 type Config struct {
@@ -109,6 +119,12 @@ type ProxyURL struct {
 	Port     string
 }
 
+type StatsManager struct {
+	successCount int32
+	mu           sync.RWMutex
+	logger       *zap.Logger
+}
+
 type WSClient interface {
 	Connect(ctx context.Context, proxy, userID string) error
 }
@@ -119,6 +135,7 @@ type ProxyChecker interface {
 
 func NewBot(config Config, logger *zap.Logger) *Bot {
 	proxyChecker := NewDefaultProxyChecker(config)
+	initStatsManager(logger) //init global stats manager
 	return &Bot{
 		config:     config,
 		logger:     logger,
@@ -233,6 +250,42 @@ func (p *FastHTTPClientPool) Put(c *fasthttp.Client) {
 
 	atomic.AddInt32(&p.metrics.ActiveConnections, -1)
 	p.pool.Put(c)
+}
+
+func initStatsManager(logger *zap.Logger) *StatsManager {
+	once.Do(func() {
+		globalStats = &StatsManager{
+			logger: logger,
+		}
+		//start single stats reporter
+		go globalStats.reportStats()
+	})
+	return globalStats
+}
+
+func (sm *StatsManager) increment() {
+	atomic.AddInt32(&sm.successCount, 1)
+}
+
+func (sm *StatsManager) decrement() {
+	atomic.AddInt32(&sm.successCount, -1)
+}
+
+func (sm *StatsManager) getCount() int32 {
+	return atomic.LoadInt32(&sm.successCount)
+}
+
+func (sm *StatsManager) reportStats() {
+	ticker := time.NewTicker(statsInterval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		count := sm.getCount()
+		sm.logger.Info(fmt.Sprintf("Active connections: %d proxies successfully sent ping",
+			count),
+			zap.Int32("active_proxies", count),
+			zap.String("status", "active"))
+	}
 }
 
 func (p *FastHTTPClientPool) AddResponseTime(duration time.Duration) {
@@ -376,23 +429,40 @@ func createProxyDialerWithFastHTTP(proxyAddr string) func(*http.Request) (*url.U
 }
 
 func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, proxyIP string) {
-	ticker := time.NewTicker(26 * time.Second)
-	defer ticker.Stop()
+	pingTicker := time.NewTicker(pingInterval)
+	defer pingTicker.Stop()
+
+	//increment counter when starting ping
+	globalStats.increment()
+	defer globalStats.decrement()
 
 	for {
 		select {
-		case <-ticker.C:
+		case <-pingTicker.C:
+			if err := c.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
+				ws.logger.Error("Failed to set write deadline",
+					zap.Error(err),
+					zap.String("ip", proxyIP))
+				return
+			}
+
 			message := map[string]interface{}{
 				"id":      uuid.New().String(),
 				"version": "1.0.0",
 				"action":  "PING",
 				"data":    map[string]interface{}{},
 			}
+
 			if err := c.WriteJSON(message); err != nil {
-				ws.logger.Error(fmt.Sprintf("Error sending ping: %v", err))
+				if !websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+					ws.logger.Error("Error sending ping",
+						zap.Error(err),
+						zap.String("ip", proxyIP))
+				}
 				return
 			}
 			ws.logger.Info(fmt.Sprintf("Sent ping - IP: %s, Message: %v", proxyIP, message))
+
 		case <-ctx.Done():
 			return
 		}
@@ -407,16 +477,13 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 		case <-ctx.Done():
 			return
 		default:
-			//read deadline
-			if err := c.SetReadDeadline(time.Now().Add(35 * time.Second)); err != nil {
-				ws.logger.Error("Failed to set read deadline", zap.Error(err))
-				return
-			}
-
 			_, message, err := c.ReadMessage()
 			if err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					ws.logger.Error(fmt.Sprintf("Error reading message: %v", err))
+					ws.logger.Error("Read error",
+						zap.Error(err),
+						zap.String("userID", userID),
+						zap.String("ip", ipInfo.IP))
 				}
 				return
 			}
@@ -427,7 +494,13 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 				continue
 			}
 
+			//log received msg
 			ws.logger.Info(fmt.Sprintf("Received message from IP %s: %v", ipInfo.IP, msg))
+
+			if err := c.SetWriteDeadline(time.Now().Add(writeDeadline)); err != nil {
+				ws.logger.Error("Failed to set write deadline", zap.Error(err))
+				return
+			}
 
 			switch msg["action"].(string) {
 			case "AUTH":
@@ -444,17 +517,22 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 					},
 				}
 				if err := c.WriteJSON(authResponse); err != nil {
-					ws.logger.Error(fmt.Sprintf("Error sending auth response: %v", err))
+					ws.logger.Error("Error sending auth response",
+						zap.Error(err),
+						zap.String("ip", ipInfo.IP))
 					return
 				}
 				ws.logger.Info(fmt.Sprintf("Sent auth response - IP: %s, Response: %v", ipInfo.IP, authResponse))
+
 			case "PONG":
 				pongResponse := map[string]interface{}{
 					"id":            msg["id"].(string),
 					"origin_action": "PONG",
 				}
 				if err := c.WriteJSON(pongResponse); err != nil {
-					ws.logger.Error(fmt.Sprintf("Error sending pong response: %v", err))
+					ws.logger.Error("Error sending pong response",
+						zap.Error(err),
+						zap.String("ip", ipInfo.IP))
 					return
 				}
 				ws.logger.Info(fmt.Sprintf("Sent pong response - IP: %s, Response: %v", ipInfo.IP, pongResponse))
@@ -541,7 +619,26 @@ func (ws *DefaultWSClient) attemptConnection(ctx context.Context, proxy, userID 
 
 	c.EnableWriteCompression(true)
 	c.SetReadLimit(32 << 20)
-	c.SetReadDeadline(time.Now().Add(35 * time.Second))
+
+	// ping handler
+	c.SetPingHandler(func(message string) error {
+		err := c.SetReadDeadline(time.Now().Add(readDeadline))
+		if err != nil {
+			return err
+		}
+		return c.WriteControl(websocket.PongMessage, []byte(message), time.Now().Add(writeDeadline))
+	})
+
+	// pong handler
+	c.SetPongHandler(func(string) error {
+		return c.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
+	// read deadline
+	err = c.SetReadDeadline(time.Now().Add(readDeadline))
+	if err != nil {
+		return fmt.Errorf("set initial deadline failed: %w", err)
+	}
 
 	errChan := make(chan error, 2)
 	done := make(chan struct{})
