@@ -250,7 +250,7 @@ func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, prox
 }
 
 func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn, ipInfo *IPInfo, deviceID, userID string) {
-	userAgent := browser.Random()
+	userAgent := browser.MacOSX()
 
 	for {
 		select {
@@ -307,7 +307,7 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 
 func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) error {
 	deviceID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte(proxy)).String()
-	userAgent := browser.Random()
+	userAgent := browser.MacOSX()
 
 	wsURL := fmt.Sprintf("wss://%s/", ws.config.WSSHost)
 	ws.logger.Info(fmt.Sprintf("Connecting to %s", wsURL))
