@@ -9,7 +9,7 @@ A high-performance proxy sender written in Go, designed for managing multiple pr
 - Real-time connection monitoring
 - Proxy health verification via ipinfo.io
 - Connection pooling with FastHTTP
-- Colorized logging with Asia/Jakarta timezone
+- Beautiful logging with Charmbracelet's Log & Lipgloss
 - Memory-efficient resource management
 - Graceful shutdown handling
 
@@ -43,7 +43,7 @@ github.com/gorilla/websocket
 github.com/itzngga/fake-useragent
 github.com/valyala/fasthttp
 github.com/valyala/fasthttp/fasthttpproxy
-go.uber.org/zap
+github.com/charmbracelet/log
 ```
 
 ## Installation
@@ -119,10 +119,11 @@ RetryInterval:        20s
 - Goroutine management
 
 ### 5. Logging
-- Structured logging with Zap
-- Colorized output
-- Asia/Jakarta timezone
+- Beautiful and informative logging with Charmbracelet Log
+- Custom styled output with Lipgloss
+- Asia/Jakarta timezone support
 - Comprehensive error tracking
+- Pretty-formatted JSON output
 
 ## Project Structure
 ```
