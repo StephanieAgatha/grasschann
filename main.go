@@ -6,6 +6,10 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/google/uuid"
+	"github.com/gorilla/websocket"
+	browser "github.com/itzngga/fake-useragent"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpproxy"
 	"net/http"
@@ -17,11 +21,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/google/uuid"
-	"github.com/gorilla/websocket"
-	"github.com/itzngga/fake-useragent"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
+	"github.com/charmbracelet/log"
 )
 
 type Config struct {
@@ -40,14 +40,14 @@ type IPInfo struct {
 
 type Bot struct {
 	config     Config
-	logger     *zap.Logger
+	logger     *log.Logger
 	wsClient   WSClient
 	proxyCheck ProxyChecker
 }
 
 type DefaultWSClient struct {
 	config     Config
-	logger     *zap.Logger
+	logger     *log.Logger
 	proxyCheck ProxyChecker
 }
 
@@ -63,7 +63,7 @@ type FastHTTPClientPool struct {
 type ProxyDistributor struct {
 	userIDs []string
 	proxies []string
-	logger  *zap.Logger
+	logger  *log.Logger
 }
 
 type WSClient interface {
@@ -82,7 +82,7 @@ func (p *FastHTTPClientPool) Put(c *fasthttp.Client) {
 	p.pool.Put(c)
 }
 
-func NewBot(config Config, logger *zap.Logger) *Bot {
+func NewBot(config Config, logger *log.Logger) *Bot {
 	proxyChecker := NewDefaultProxyChecker(config)
 	return &Bot{
 		config:     config,
@@ -92,7 +92,7 @@ func NewBot(config Config, logger *zap.Logger) *Bot {
 	}
 }
 
-func NewDefaultWSClient(config Config, logger *zap.Logger, proxyCheck ProxyChecker) *DefaultWSClient {
+func NewDefaultWSClient(config Config, logger *log.Logger, proxyCheck ProxyChecker) *DefaultWSClient {
 	return &DefaultWSClient{
 		config:     config,
 		logger:     logger,
@@ -132,41 +132,38 @@ func fastHTTPHeadersToHTTP(fHeaders *fasthttp.RequestHeader) http.Header {
 	return httpHeaders
 }
 
-func initLogger() *zap.Logger {
-	jakartaLocation, _ := time.LoadLocation("Asia/Jakarta")
+func initLogger() *log.Logger {
+	// new log using charm and 💄(lipgloss) haha
+	logger := log.NewWithOptions(os.Stderr, log.Options{
+		ReportCaller:    true,
+		ReportTimestamp: true,
+		TimeFormat:      "2006-01-02 15:04:05",
+		Level:           log.InfoLevel,
+		Prefix:          "Grass 🌱",
+	})
 
-	encoderConfig := zapcore.EncoderConfig{
-		TimeKey:       "T",
-		LevelKey:      "L",
-		NameKey:       "N",
-		CallerKey:     "C",
-		MessageKey:    "M",
-		StacktraceKey: "S",
-		LineEnding:    zapcore.DefaultLineEnding,
-		EncodeLevel:   zapcore.CapitalColorLevelEncoder,
-		EncodeTime: func(t time.Time, enc zapcore.PrimitiveArrayEncoder) {
-			enc.AppendString(t.In(jakartaLocation).Format("02/01/2006-15:04:05"))
-		},
-		EncodeDuration: zapcore.SecondsDurationEncoder,
-		EncodeCaller:   zapcore.ShortCallerEncoder,
-	}
+	// get default styles and customize them
+	styles := log.DefaultStyles()
 
-	config := zap.Config{
-		Level:       zap.NewAtomicLevelAt(zap.InfoLevel),
-		Development: false,
-		Sampling: &zap.SamplingConfig{
-			Initial:    100,
-			Thereafter: 100,
-		},
-		Encoding:         "console",
-		EncoderConfig:    encoderConfig,
-		OutputPaths:      []string{"stdout"},
-		ErrorOutputPaths: []string{"stderr"},
-	}
+	// customize error level appearance
+	styles.Levels[log.ErrorLevel] = lipgloss.NewStyle().
+		SetString("ERROR").
+		Padding(0, 1, 0, 1).
+		Foreground(lipgloss.Color("204")) // red
 
-	consoleEncoder := zapcore.NewConsoleEncoder(encoderConfig)
-	core := zapcore.NewCore(consoleEncoder, zapcore.AddSync(os.Stdout), config.Level)
-	return zap.New(core)
+	//make error messages and values stand out
+	styles.Keys["error"] = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("204")) // red color for error keys
+	styles.Values["error"] = lipgloss.NewStyle()
+
+	// change all regular keys to cyan
+	styles.Key = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("51")) // bright cyan color for all keys
+
+	// set customized styles
+	logger.SetStyles(styles)
+
+	return logger
 }
 
 func (pc *DefaultProxyChecker) GetProxyIP(proxy string) (*IPInfo, error) {
@@ -241,10 +238,12 @@ func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, prox
 				"data":    map[string]interface{}{},
 			}
 			if err := c.WriteJSON(message); err != nil {
-				ws.logger.Error(fmt.Sprintf("Error sending ping: %v", err))
+				ws.logger.Error("error sending ping", "error", err)
 				return
 			}
-			ws.logger.Info(fmt.Sprintf("Sent ping - IP: %s, Message: %v", proxyIP, message))
+			ws.logger.Info("sent ping",
+				"ip", proxyIP,
+				"message", message)
 		case <-ctx.Done():
 			return
 		}
@@ -261,17 +260,19 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 		default:
 			_, message, err := c.ReadMessage()
 			if err != nil {
-				ws.logger.Error(fmt.Sprintf("Error reading message: %v", err))
+				ws.logger.Error("error reading message", "error", err)
 				return
 			}
 
 			var msg map[string]interface{}
 			if err := json.Unmarshal(message, &msg); err != nil {
-				ws.logger.Error(fmt.Sprintf("Error unmarshalling message: %v", err))
+				ws.logger.Error("error unmarshalling message", "error", err)
 				continue
 			}
 
-			ws.logger.Info(fmt.Sprintf("Received message from IP %s: %v", ipInfo.IP, msg))
+			ws.logger.Info("received message",
+				"ip", ipInfo.IP,
+				"message", msg)
 
 			switch msg["action"].(string) {
 			case "AUTH":
@@ -288,20 +289,24 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 					},
 				}
 				if err := c.WriteJSON(authResponse); err != nil {
-					ws.logger.Error(fmt.Sprintf("Error sending auth response: %v", err))
+					ws.logger.Error("error sending auth response", "error", err)
 					return
 				}
-				ws.logger.Info(fmt.Sprintf("Sent auth response - IP: %s, Response: %v", ipInfo.IP, authResponse))
+				ws.logger.Info("sent auth response",
+					"ip", ipInfo.IP,
+					"response", authResponse)
 			case "PONG":
 				pongResponse := map[string]interface{}{
 					"id":            msg["id"].(string),
 					"origin_action": "PONG",
 				}
 				if err := c.WriteJSON(pongResponse); err != nil {
-					ws.logger.Error(fmt.Sprintf("Error sending pong response: %v", err))
+					ws.logger.Error("error sending pong response", "error", err)
 					return
 				}
-				ws.logger.Info(fmt.Sprintf("Sent pong response - IP: %s, Response: %v", ipInfo.IP, pongResponse))
+				ws.logger.Info("sent pong response",
+					"ip", ipInfo.IP,
+					"response", pongResponse)
 			}
 		}
 	}
@@ -312,7 +317,7 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 	userAgent := browser.MacOSX()
 
 	wsURL := fmt.Sprintf("wss://%s/", ws.config.WSSHost)
-	ws.logger.Info(fmt.Sprintf("Connecting to %s", wsURL))
+	ws.logger.Info("connecting to websocket", "url", wsURL)
 
 	headers := prepareHeaders(userAgent)
 
@@ -330,14 +335,16 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 	}
 	defer c.Close()
 
-	ws.logger.Info("Connected to WebSocket")
+	ws.logger.Info("connected to websocket")
 
 	ipInfo, err := ws.proxyCheck.GetProxyIP(proxy)
 	if err != nil {
 		return fmt.Errorf("error getting proxy IP info: %v", err)
 	}
-	ws.logger.Info(fmt.Sprintf("Proxy location info - IP: %s, City: %s, Region: %s",
-		ipInfo.IP, ipInfo.City, ipInfo.Region))
+	ws.logger.Info("proxy location info",
+		"ip", ipInfo.IP,
+		"city", ipInfo.City,
+		"region", ipInfo.Region)
 
 	go ws.sendPing(ctx, c, ipInfo.IP)
 	ws.handleMessages(ctx, c, ipInfo, deviceID, userID)
@@ -373,15 +380,15 @@ func (pd *ProxyDistributor) DistributeProxies() map[string][]string {
 		distribution[userID] = pd.proxies[currentIndex : currentIndex+proxiesForThisUser]
 		currentIndex += proxiesForThisUser
 
-		pd.logger.Info("Distributed proxies for user",
-			zap.String("userID", userID),
-			zap.Int("proxyCount", len(distribution[userID])))
+		pd.logger.Info("distributed proxies for user",
+			"userID", userID,
+			"proxyCount", len(distribution[userID]))
 	}
 
 	return distribution
 }
 
-func NewProxyDistributor(userIDs, proxies []string, logger *zap.Logger) *ProxyDistributor {
+func NewProxyDistributor(userIDs, proxies []string, logger *log.Logger) *ProxyDistributor {
 	return &ProxyDistributor{
 		userIDs: userIDs,
 		proxies: proxies,
@@ -414,7 +421,6 @@ func main() {
 	}
 
 	logger := initLogger()
-	defer logger.Sync()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -424,17 +430,17 @@ func main() {
 
 	proxies, err := readLines("proxy.txt")
 	if err != nil {
-		logger.Fatal("Error reading proxies", zap.Error(err))
+		logger.Fatal("error reading proxies", "error", err)
 	}
 
 	userIDs, err := readLines("uid.txt")
 	if err != nil {
-		logger.Fatal("Error reading user IDs", zap.Error(err))
+		logger.Fatal("error reading user IDs", "error", err)
 	}
 
 	distributor := NewProxyDistributor(userIDs, proxies, logger)
 	if err := distributor.Validate(); err != nil {
-		logger.Fatal("Proxy distribution validation failed", zap.Error(err))
+		logger.Fatal("proxy distribution validation failed", "error", err)
 	}
 
 	proxyDistribution := distributor.DistributeProxies()
@@ -453,16 +459,16 @@ func main() {
 					for {
 						select {
 						case <-ctx.Done():
-							logger.Info("Shutting down connection",
-								zap.String("userID", userID),
-								zap.String("proxy", proxy))
+							logger.Info("shutting down connection",
+								"userID", userID,
+								"proxy", proxy)
 							return
 						default:
 							if err := bot.wsClient.Connect(ctx, proxy, userID); err != nil {
-								logger.Error("Connection error",
-									zap.Error(err),
-									zap.String("userID", userID),
-									zap.String("proxy", proxy))
+								logger.Error("connection error",
+									"error", err,
+									"userID", userID,
+									"proxy", proxy)
 								select {
 								case <-ctx.Done():
 									return
@@ -479,27 +485,24 @@ func main() {
 		close(done)
 	}()
 
-	//handle shutdown
 	select {
 	case sig := <-signals:
-		logger.Info("Received shutdown signal", zap.String("signal", sig.String()))
+		logger.Info("received shutdown signal", "signal", sig.String())
 		cancel()
-		//wait for graceful shutdown with timeout
 		shutdownTimeout := time.NewTimer(30 * time.Second)
 		select {
 		case <-done:
-			logger.Info("All connections closed successfully")
+			logger.Info("all connections closed successfully")
 		case <-shutdownTimeout.C:
-			logger.Warn("Shutdown timed out, forcing exit")
+			logger.Warn("shutdown timed out, forcing exit")
 		}
 
-		//final cleanup
-		logger.Info("Cleaning up resources")
-		time.Sleep(2 * time.Second) //give time for final cleanup
+		logger.Info("cleaning up resources")
+		time.Sleep(2 * time.Second)
 
 	case <-done:
-		logger.Info("All connections finished naturally")
+		logger.Info("all connections finished naturally")
 	}
 
-	logger.Info("Program exiting")
+	logger.Info("program exiting")
 }
