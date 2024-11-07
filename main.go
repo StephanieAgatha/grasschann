@@ -163,6 +163,9 @@ func initLogger() *log.Logger {
 	// set customized styles
 	logger.SetStyles(styles)
 
+	// set env timezone to asia/jkt
+	os.Setenv("TZ", "Asia/Jakarta")
+
 	return logger
 }
 
