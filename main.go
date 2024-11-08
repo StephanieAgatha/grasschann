@@ -211,11 +211,8 @@ func prepareHeaders(userAgent string) *fasthttp.RequestHeader {
 	headers := &fasthttp.RequestHeader{}
 	headers.SetUserAgent(userAgent)
 	headers.Set("pragma", "no-cache")
-	headers.Set("Accept-Language", "en-US,en;q=0.9")
+	headers.Set("Accept-Language", "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7")
 	headers.Set("Cache-Control", "no-cache")
-	headers.Set("connection", "Upgrade")
-	headers.Set("upgrade", "websocket")
-	headers.Set("sec-websocket-version", "13")
 	return headers
 }
 
