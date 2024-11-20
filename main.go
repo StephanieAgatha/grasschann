@@ -288,7 +288,7 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 						"user_agent":  userAgent,
 						"timestamp":   time.Now().Unix(),
 						"device_type": "desktop",
-						"version":     "4.9",
+						"version":     "4.29.0",
 					},
 				}
 				if err := c.WriteJSON(authResponse); err != nil {
@@ -419,7 +419,7 @@ func main() {
 	config := Config{
 		ProxyURLTemplate: "http://%s",
 		IPCheckURL:       "https://ipinfo.io/json",
-		WSSHost:          "proxy2.wynd.network:4650",
+		WSSHost:          "proxy2.wynd.network:4650", //proxy2.wynd.network:4444
 		RetryInterval:    20 * time.Second,
 	}
 
