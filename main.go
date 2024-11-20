@@ -419,7 +419,7 @@ func main() {
 	config := Config{
 		ProxyURLTemplate: "http://%s",
 		IPCheckURL:       "https://ipinfo.io/json",
-		WSSHost:          "proxy2.wynd.network:4650", //proxy2.wynd.network:4444
+		WSSHost:          "proxy2.wynd.network:4444",
 		RetryInterval:    20 * time.Second,
 	}
 
