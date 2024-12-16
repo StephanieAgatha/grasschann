@@ -288,7 +288,7 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 						"user_agent":  userAgent,
 						"timestamp":   time.Now().Unix(),
 						"device_type": "desktop",
-						"version":     "4.29.0",
+						"version":     "4.30.0",
 					},
 				}
 				if err := c.WriteJSON(authResponse); err != nil {
