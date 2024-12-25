@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"github.com/charmbracelet/lipgloss"
@@ -12,6 +13,8 @@ import (
 	browser "github.com/itzngga/fake-useragent"
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpproxy"
+	"io"
+	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -49,6 +52,7 @@ type DefaultWSClient struct {
 	config     Config
 	logger     *log.Logger
 	proxyCheck ProxyChecker
+	writeMu    sync.Mutex
 }
 
 type DefaultProxyChecker struct {
@@ -122,6 +126,12 @@ func NewFastHTTPClientPool() *FastHTTPClientPool {
 			},
 		},
 	}
+}
+
+func (ws *DefaultWSClient) writeJSON(c *websocket.Conn, v interface{}) error {
+	ws.writeMu.Lock()
+	defer ws.writeMu.Unlock()
+	return c.WriteJSON(v)
 }
 
 func fastHTTPHeadersToHTTP(fHeaders *fasthttp.RequestHeader) http.Header {
@@ -227,6 +237,29 @@ func createProxyDialerWithFastHTTP(proxyAddr string) func(*http.Request) (*url.U
 	}
 }
 
+func (ws *DefaultWSClient) performInitialRequest(c *websocket.Conn, proxyIP string) error {
+	messageID := uuid.New().String()
+	requestMessage := map[string]interface{}{
+		"id":     messageID,
+		"action": "HTTP_REQUEST",
+		"data": map[string]interface{}{
+			"method": "GET",
+			"url":    "https://www.wynd.network/",
+			"headers": map[string]string{
+				"Accept":     "*/*",
+				"User-Agent": "wynd.network/3.0.1",
+			},
+		},
+	}
+
+	if err := ws.writeJSON(c, requestMessage); err != nil {
+		return fmt.Errorf("error sending HTTP request message: %v", err)
+	}
+
+	ws.logger.Info("sent initial HTTP request message", "ip", proxyIP)
+	return nil
+}
+
 func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, proxyIP string) {
 	ticker := time.NewTicker(26 * time.Second)
 	defer ticker.Stop()
@@ -240,13 +273,11 @@ func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, prox
 				"action":  "PING",
 				"data":    map[string]interface{}{},
 			}
-			if err := c.WriteJSON(message); err != nil {
+			if err := ws.writeJSON(c, message); err != nil {
 				ws.logger.Error("error sending ping", "error", err)
 				return
 			}
-			ws.logger.Info("sent ping",
-				"ip", proxyIP,
-				"message", message)
+			ws.logger.Info("sent ping", "ip", proxyIP, "message", message)
 		case <-ctx.Done():
 			return
 		}
@@ -255,6 +286,12 @@ func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, prox
 
 func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn, ipInfo *IPInfo, deviceID, userID string) {
 	userAgent := browser.MacOSX()
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	var authCompleted bool
+	var httpRequestCompleted bool
 
 	for {
 		select {
@@ -273,43 +310,154 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 				continue
 			}
 
-			ws.logger.Info("received message",
-				"ip", ipInfo.IP,
-				"message", msg)
+			ws.logger.Info("received message", "ip", ipInfo.IP, "message", msg)
 
-			switch msg["action"].(string) {
+			action, ok := msg["action"].(string)
+			if !ok {
+				ws.logger.Error("invalid action type")
+				continue
+			}
+
+			messageID, ok := msg["id"].(string)
+			if !ok {
+				ws.logger.Error("invalid message ID type")
+				continue
+			}
+
+			switch action {
 			case "AUTH":
-				authResponse := map[string]interface{}{
-					"id":            msg["id"].(string),
-					"origin_action": "AUTH",
-					"result": map[string]interface{}{
-						"browser_id":  deviceID,
-						"user_id":     userID,
-						"user_agent":  userAgent,
-						"timestamp":   time.Now().Unix(),
-						"device_type": "desktop",
-						"version":     "4.30.0",
-					},
+				if !authCompleted {
+					authResponse := map[string]interface{}{
+						"id":            messageID,
+						"origin_action": "AUTH",
+						"result": map[string]interface{}{
+							"browser_id":  deviceID,
+							"user_id":     userID,
+							"user_agent":  userAgent,
+							"timestamp":   time.Now().Unix(),
+							"device_type": "desktop",
+							"version":     "4.30.0",
+						},
+					}
+					if err := ws.writeJSON(c, authResponse); err != nil {
+						ws.logger.Error("error sending auth response", "error", err)
+						return
+					}
+					ws.logger.Info("sent auth response", "ip", ipInfo.IP, "response", authResponse)
+					authCompleted = true
+
+					// Send HTTP request right after AUTH response
+					if err := ws.performInitialRequest(c, ipInfo.IP); err != nil {
+						ws.logger.Error("error performing initial request", "error", err)
+						return
+					}
 				}
-				if err := c.WriteJSON(authResponse); err != nil {
-					ws.logger.Error("error sending auth response", "error", err)
+
+			case "HTTP_REQUEST":
+				data, ok := msg["data"].(map[string]interface{})
+				if !ok {
+					ws.logger.Error("invalid data type in HTTP_REQUEST")
+					continue
+				}
+
+				url, ok := data["url"].(string)
+				if !ok {
+					ws.logger.Error("invalid URL type in HTTP_REQUEST")
+					continue
+				}
+
+				var response map[string]interface{}
+
+				if strings.Contains(url, "api.getgrass.io") {
+					ws.logger.Info("handling grass api request")
+
+					req, err := http.NewRequest("GET", url, nil)
+					if err != nil {
+						ws.logger.Error("error creating request", "error", err)
+						continue
+					}
+
+					req.Header.Set("Accept", "*/*")
+					req.Header.Set("Host", "api.getgrass.io")
+					req.Header.Set("User-Agent", "wynd.network/3.0.1")
+
+					resp, err := httpClient.Do(req)
+					if err != nil {
+						ws.logger.Error("error making request", "error", err)
+						continue
+					}
+					defer resp.Body.Close()
+
+					body, err := io.ReadAll(resp.Body)
+					if err != nil {
+						ws.logger.Error("error reading response body", "error", err)
+						continue
+					}
+
+					headers := [][]string{}
+					for key, values := range resp.Header {
+						for _, value := range values {
+							headers = append(headers, []string{key, value})
+						}
+					}
+
+					response = map[string]interface{}{
+						"id":            messageID,
+						"origin_action": "HTTP_REQUEST",
+						"data": map[string]interface{}{
+							"url":         url,
+							"status":      resp.StatusCode,
+							"status_text": resp.Status,
+							"headers":     headers,
+							"body":        base64.StdEncoding.EncodeToString(body),
+						},
+					}
+				} else {
+					ws.logger.Info("forging request response")
+					const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+					randStr := make([]byte, 16)
+					for i := range randStr {
+						randStr[i] = chars[rand.Intn(len(chars))]
+					}
+
+					response = map[string]interface{}{
+						"id":            messageID,
+						"origin_action": "HTTP_REQUEST",
+						"data": map[string]interface{}{
+							"url":         url,
+							"status":      200,
+							"status_text": "",
+							"headers":     [][]string{},
+							"body":        base64.StdEncoding.EncodeToString(randStr),
+						},
+					}
+				}
+
+				if err := ws.writeJSON(c, response); err != nil {
+					ws.logger.Error("error sending HTTP response", "error", err)
 					return
 				}
-				ws.logger.Info("sent auth response",
-					"ip", ipInfo.IP,
-					"response", authResponse)
+				ws.logger.Info("sent HTTP response", "ip", ipInfo.IP, "url", url)
+
+				if !httpRequestCompleted {
+					httpRequestCompleted = true
+					// Start ping cycle after first HTTP_REQUEST is completed
+					go ws.sendPing(ctx, c, ipInfo.IP)
+				}
+
 			case "PONG":
 				pongResponse := map[string]interface{}{
-					"id":            msg["id"].(string),
+					"id":            messageID,
 					"origin_action": "PONG",
 				}
-				if err := c.WriteJSON(pongResponse); err != nil {
+				if err := ws.writeJSON(c, pongResponse); err != nil {
 					ws.logger.Error("error sending pong response", "error", err)
 					return
 				}
-				ws.logger.Info("sent pong response",
-					"ip", ipInfo.IP,
-					"response", pongResponse)
+				ws.logger.Info("sent pong response", "ip", ipInfo.IP, "response", pongResponse)
+
+			default:
+				ws.logger.Debug("unhandled action", "action", action)
 			}
 		}
 	}
@@ -323,7 +471,6 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 	ws.logger.Info("connecting to websocket", "url", wsURL)
 
 	headers := prepareHeaders(userAgent)
-
 	dialer := websocket.Dialer{
 		Proxy:            createProxyDialerWithFastHTTP(proxy),
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
@@ -331,7 +478,6 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 	}
 
 	httpHeaders := fastHTTPHeadersToHTTP(headers)
-
 	c, _, err := dialer.DialContext(ctx, wsURL, httpHeaders)
 	if err != nil {
 		return fmt.Errorf("error connecting to WebSocket: %v", err)
