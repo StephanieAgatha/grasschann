@@ -472,7 +472,13 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 	wsURL := fmt.Sprintf("wss://%s/", ws.config.WSSHost)
 	ws.logger.Info("connecting to websocket", "url", wsURL)
 
-	headers := prepareHeaders(userAgent)
+	headers := &fasthttp.RequestHeader{}
+	headers.Set("User-Agent", userAgent)
+	headers.Set("pragma", "no-cache")
+	headers.Set("Origin", "chrome-extension://lkbnfiajjmbhnfledhphioinpickokdi")
+	headers.Set("Accept-Language", "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7")
+	headers.Set("Cache-Control", "no-cache")
+
 	dialer := websocket.Dialer{
 		Proxy:            createProxyDialerWithFastHTTP(proxy),
 		TLSClientConfig:  &tls.Config{InsecureSkipVerify: true},
