@@ -331,12 +331,14 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 						"id":            messageID,
 						"origin_action": "AUTH",
 						"result": map[string]interface{}{
-							"browser_id":  deviceID,
-							"user_id":     userID,
-							"user_agent":  userAgent,
-							"timestamp":   time.Now().Unix(),
-							"device_type": "desktop",
-							"version":     "4.30.0",
+							"browser_id":   deviceID,
+							"user_id":      userID,
+							"user_agent":   userAgent,
+							"timestamp":    time.Now().Unix(),
+							"device_type":  "extension",
+							"extension_id": "lkbnfiajjmbhnfledhphioinpickokdi",
+							"version":      "4.26.2",
+							//"device_type": "desktop", //deprecated, use ext for a while
 						},
 					}
 					if err := ws.writeJSON(c, authResponse); err != nil {
@@ -346,7 +348,7 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 					ws.logger.Info("sent auth response", "ip", ipInfo.IP, "response", authResponse)
 					authCompleted = true
 
-					// Send HTTP request right after AUTH response
+					// send http req right after auth response
 					if err := ws.performInitialRequest(c, ipInfo.IP); err != nil {
 						ws.logger.Error("error performing initial request", "error", err)
 						return
@@ -441,7 +443,7 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 
 				if !httpRequestCompleted {
 					httpRequestCompleted = true
-					// Start ping cycle after first HTTP_REQUEST is completed
+					// start ping cycle after first http_request is completed
 					go ws.sendPing(ctx, c, ipInfo.IP)
 				}
 
