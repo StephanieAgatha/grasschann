@@ -14,7 +14,6 @@ import (
 	"github.com/valyala/fasthttp"
 	"github.com/valyala/fasthttp/fasthttpproxy"
 	"io"
-	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
@@ -237,38 +236,31 @@ func createProxyDialerWithFastHTTP(proxyAddr string) func(*http.Request) (*url.U
 	}
 }
 
-func (ws *DefaultWSClient) performInitialRequest(c *websocket.Conn, proxyIP string) error {
-	messageID := uuid.New().String()
-	requestMessage := map[string]interface{}{
-		"id":     messageID,
-		"action": "HTTP_REQUEST",
-		"data": map[string]interface{}{
-			"method": "GET",
-			"url":    "https://www.wynd.network/",
-			"headers": map[string]string{
-				"Accept":     "*/*",
-				"User-Agent": "wynd.network/3.0.1",
-			},
-		},
-	}
-
-	if err := ws.writeJSON(c, requestMessage); err != nil {
-		return fmt.Errorf("error sending HTTP request message: %v", err)
-	}
-
-	ws.logger.Info("sent initial HTTP request message", "ip", proxyIP)
-	return nil
-}
-
 func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, proxyIP string) {
-	ticker := time.NewTicker(26 * time.Second)
+	// Immediately start sending pings as we're only called after HTTP_REQUEST is processed
+	message := map[string]interface{}{
+		"id":      uuid.NewSHA1(uuid.NameSpaceDNS, []byte(proxyIP)).String(),
+		"version": "1.0.0",
+		"action":  "PING",
+		"data":    map[string]interface{}{},
+	}
+
+	if err := ws.writeJSON(c, message); err != nil {
+		ws.logger.Error("error sending initial ping", "error", err)
+		return
+	}
+	ws.logger.Info("sending ping", "ip", proxyIP, "message", message)
+
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-ticker.C:
 			message := map[string]interface{}{
-				"id":      uuid.New().String(),
+				"id":      uuid.NewSHA1(uuid.NameSpaceDNS, []byte(proxyIP)).String(),
 				"version": "1.0.0",
 				"action":  "PING",
 				"data":    map[string]interface{}{},
@@ -277,27 +269,31 @@ func (ws *DefaultWSClient) sendPing(ctx context.Context, c *websocket.Conn, prox
 				ws.logger.Error("error sending ping", "error", err)
 				return
 			}
-			ws.logger.Info("sent ping", "ip", proxyIP, "message", message)
-		case <-ctx.Done():
-			return
+			ws.logger.Info("sending ping", "ip", proxyIP, "message", message)
 		}
 	}
 }
 
-func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn, ipInfo *IPInfo, deviceID, userID string) {
-	userAgent := browser.MacOSX()
+func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn, ipInfo *IPInfo, deviceID, userID, userAgent string) {
 	httpClient := &http.Client{
 		Timeout: 30 * time.Second,
 	}
 
-	var authCompleted bool
-	var httpRequestCompleted bool
+	hasReceivedAction := false
+	isAuthenticated := false
+	var pingStarted bool
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
+			if isAuthenticated && !hasReceivedAction {
+				ws.logger.Info("authenticated | wait until the ping gate opens",
+					"ip", ipInfo.IP,
+					"message", "Waiting for HTTP_REQUEST")
+			}
+
 			_, message, err := c.ReadMessage()
 			if err != nil {
 				ws.logger.Error("error reading message", "error", err)
@@ -326,34 +322,25 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 
 			switch action {
 			case "AUTH":
-				if !authCompleted {
-					authResponse := map[string]interface{}{
-						"id":            messageID,
-						"origin_action": "AUTH",
-						"result": map[string]interface{}{
-							"browser_id":   deviceID,
-							"user_id":      userID,
-							"user_agent":   userAgent,
-							"timestamp":    time.Now().Unix(),
-							"device_type":  "extension",
-							"extension_id": "lkbnfiajjmbhnfledhphioinpickokdi",
-							"version":      "4.26.2",
-							//"device_type": "desktop", //deprecated, use ext for a while
-						},
-					}
-					if err := ws.writeJSON(c, authResponse); err != nil {
-						ws.logger.Error("error sending auth response", "error", err)
-						return
-					}
-					ws.logger.Info("sent auth response", "ip", ipInfo.IP, "response", authResponse)
-					authCompleted = true
-
-					// send http req right after auth response
-					if err := ws.performInitialRequest(c, ipInfo.IP); err != nil {
-						ws.logger.Error("error performing initial request", "error", err)
-						return
-					}
+				authResponse := map[string]interface{}{
+					"id":            messageID,
+					"origin_action": "AUTH",
+					"result": map[string]interface{}{
+						"browser_id":   deviceID,
+						"user_id":      userID,
+						"user_agent":   userAgent,
+						"timestamp":    time.Now().Unix(),
+						"device_type":  "extension",
+						"version":      "4.26.2",
+						"extension_id": "lkbnfiajjmbhnfledhphioinpickokdi",
+					},
 				}
+				if err := ws.writeJSON(c, authResponse); err != nil {
+					ws.logger.Error("error sending auth response", "error", err)
+					return
+				}
+				ws.logger.Info("authenticating", "ip", ipInfo.IP, "response", authResponse)
+				isAuthenticated = true
 
 			case "HTTP_REQUEST":
 				data, ok := msg["data"].(map[string]interface{})
@@ -368,86 +355,64 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 					continue
 				}
 
-				var response map[string]interface{}
+				req, err := http.NewRequest("GET", url, nil)
+				if err != nil {
+					ws.logger.Error("error creating request", "error", err)
+					continue
+				}
 
-				if strings.Contains(url, "api.getgrass.io") {
-					ws.logger.Info("handling grass api request")
+				req.Header.Set("User-Agent", userAgent)
+				req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
-					req, err := http.NewRequest("GET", url, nil)
-					if err != nil {
-						ws.logger.Error("error creating request", "error", err)
-						continue
-					}
+				resp, err := httpClient.Do(req)
+				if err != nil {
+					ws.logger.Error("error making request", "error", err)
+					continue
+				}
+				defer resp.Body.Close()
 
-					req.Header.Set("Accept", "*/*")
-					req.Header.Set("Host", "api.getgrass.io")
-					req.Header.Set("User-Agent", "wynd.network/3.0.1")
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					ws.logger.Error("error reading response body", "error", err)
+					continue
+				}
 
-					resp, err := httpClient.Do(req)
-					if err != nil {
-						ws.logger.Error("error making request", "error", err)
-						continue
-					}
-					defer resp.Body.Close()
+				headers := make(map[string]string)
+				for key, values := range resp.Header {
+					headers[key] = values[0]
+				}
 
-					body, err := io.ReadAll(resp.Body)
-					if err != nil {
-						ws.logger.Error("error reading response body", "error", err)
-						continue
-					}
-
-					headers := [][]string{}
-					for key, values := range resp.Header {
-						for _, value := range values {
-							headers = append(headers, []string{key, value})
-						}
-					}
-
-					response = map[string]interface{}{
-						"id":            messageID,
-						"origin_action": "HTTP_REQUEST",
-						"data": map[string]interface{}{
-							"url":         url,
-							"status":      resp.StatusCode,
-							"status_text": resp.Status,
-							"headers":     headers,
-							"body":        base64.StdEncoding.EncodeToString(body),
-						},
-					}
-				} else {
-					ws.logger.Info("forging request response")
-					const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-					randStr := make([]byte, 16)
-					for i := range randStr {
-						randStr[i] = chars[rand.Intn(len(chars))]
-					}
-
-					response = map[string]interface{}{
-						"id":            messageID,
-						"origin_action": "HTTP_REQUEST",
-						"data": map[string]interface{}{
-							"url":         url,
-							"status":      200,
-							"status_text": "",
-							"headers":     [][]string{},
-							"body":        base64.StdEncoding.EncodeToString(randStr),
-						},
-					}
+				statusText := http.StatusText(resp.StatusCode)
+				response := map[string]interface{}{
+					"id":            messageID,
+					"origin_action": "HTTP_REQUEST",
+					"result": map[string]interface{}{
+						"url":         url,
+						"status":      resp.StatusCode,
+						"status_text": statusText,
+						"headers":     headers,
+						"body":        base64.StdEncoding.EncodeToString(body),
+					},
 				}
 
 				if err := ws.writeJSON(c, response); err != nil {
 					ws.logger.Error("error sending HTTP response", "error", err)
 					return
 				}
-				ws.logger.Info("sent HTTP response", "ip", ipInfo.IP, "url", url)
+				ws.logger.Info("opening ping access",
+					"ip", ipInfo.IP,
+					"url", url,
+					"response", response)
 
-				if !httpRequestCompleted {
-					httpRequestCompleted = true
-					// start ping cycle after first http_request is completed
+				if !pingStarted {
+					hasReceivedAction = true
+					pingStarted = true
 					go ws.sendPing(ctx, c, ipInfo.IP)
 				}
 
 			case "PONG":
+				ws.logger.Info("received pong", "ip", ipInfo.IP, "message", msg)
+
 				pongResponse := map[string]interface{}{
 					"id":            messageID,
 					"origin_action": "PONG",
@@ -456,7 +421,7 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 					ws.logger.Error("error sending pong response", "error", err)
 					return
 				}
-				ws.logger.Info("sent pong response", "ip", ipInfo.IP, "response", pongResponse)
+				ws.logger.Info("sending pong", "ip", ipInfo.IP, "response", pongResponse)
 
 			default:
 				ws.logger.Debug("unhandled action", "action", action)
@@ -467,10 +432,10 @@ func (ws *DefaultWSClient) handleMessages(ctx context.Context, c *websocket.Conn
 
 func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) error {
 	deviceID := uuid.NewSHA1(uuid.NameSpaceDNS, []byte(proxy)).String()
-	userAgent := browser.MacOSX()
+	userAgent := browser.MacOSX() // gen user agent once
 
 	wsURL := fmt.Sprintf("wss://%s/", ws.config.WSSHost)
-	ws.logger.Info("connecting to websocket", "url", wsURL)
+	ws.logger.Info("connecting to websocket", "url", wsURL, "userAgent", userAgent)
 
 	headers := &fasthttp.RequestHeader{}
 	headers.Set("User-Agent", userAgent)
@@ -503,8 +468,7 @@ func (ws *DefaultWSClient) Connect(ctx context.Context, proxy, userID string) er
 		"city", ipInfo.City,
 		"region", ipInfo.Region)
 
-	go ws.sendPing(ctx, c, ipInfo.IP)
-	ws.handleMessages(ctx, c, ipInfo, deviceID, userID)
+	ws.handleMessages(ctx, c, ipInfo, deviceID, userID, userAgent)
 
 	return nil
 }
