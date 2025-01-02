@@ -216,15 +216,6 @@ func (pc *DefaultProxyChecker) GetProxyIP(proxy string) (*IPInfo, error) {
 	return &ipInfo, nil
 }
 
-func prepareHeaders(userAgent string) *fasthttp.RequestHeader {
-	headers := &fasthttp.RequestHeader{}
-	headers.SetUserAgent(userAgent)
-	headers.Set("pragma", "no-cache")
-	headers.Set("Accept-Language", "uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7")
-	headers.Set("Cache-Control", "no-cache")
-	return headers
-}
-
 func createProxyDialerWithFastHTTP(proxyAddr string) func(*http.Request) (*url.URL, error) {
 	return func(*http.Request) (*url.URL, error) {
 		if strings.HasPrefix(proxyAddr, "socks5://") {
